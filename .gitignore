@@ -1,0 +1,26 @@
+# Build artifacts
+dos_client/obj/
+dos_client/build/RETRO.EXE
+dos_client/build/HELLO.exe
+dos_client/build/*.SWP
+dos_client/build/*.TMP
+
+# Test/capture output
+dos_client/capture/
+pi_server/test_output/
+
+# Python
+pi_server/venv/
+pi_server/__pycache__/
+*.pyc
+
+# Tools (large binaries, not source)
+tools/
+
+# DOSBox-X runtime
+dos_client/dosbox-x.log
+
+# OS files
+Thumbs.db
+desktop.ini
+.DS_Store
