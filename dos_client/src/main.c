@@ -5,7 +5,7 @@
  * Phase 2: Network rendering (RLE/XOR tiles)             [DONE]
  * Phase 3: Mouse cursor and input (click, scroll, keys)  [DONE]
  * Phase 4: Browser chrome (address bar, nav buttons)  [DONE]
- * Phase 5: Interaction map and local text editing
+ * Phase 5: Interaction map + forwarding mode + cursors [DONE]
  */
 
 #include <stdio.h>
@@ -25,6 +25,7 @@
 #include "input.h"
 #include "cursor.h"
 #include "chrome.h"
+#include "interact.h"
 
 #define TILE_SIZE 16
 
@@ -166,6 +167,7 @@ static int run_browser(Config *cfg, VideoConfig *vc)
     RenderContext render;
     SoftCursor cursor;
     ChromeState chrome;
+    InteractCtx interact;
     MouseState mouse;
     int rc;
     msg_header_t header;
@@ -176,6 +178,7 @@ static int run_browser(Config *cfg, VideoConfig *vc)
     /* Initialize subsystems */
     cursor_init(&cursor);
     chrome_init(&chrome, vc);
+    interact_init(&interact);
     memset(&mouse, 0, sizeof(mouse));
 
     chrome_set_status(&chrome, "Connecting...");
@@ -263,14 +266,15 @@ static int run_browser(Config *cfg, VideoConfig *vc)
                 break;
 
             case MSG_STATUS: {
-                /* Status messages contain URL | title text.
-                 * Parse to update both chrome URL and status bar. */
-                int slen = payload_len < 127 ? payload_len : 127;
-                char status_buf[128];
-                memcpy(status_buf, payload_buf, slen);
-                status_buf[slen] = '\0';
-                chrome_set_status(&chrome, status_buf);
-                chrome_draw_status(&chrome, vc);
+                /* Don't overwrite DIRECT mode indicator */
+                if (interact.mode != INTERACT_MODE_FORWARD) {
+                    int slen = payload_len < 127 ? payload_len : 127;
+                    char status_buf[128];
+                    memcpy(status_buf, payload_buf, slen);
+                    status_buf[slen] = '\0';
+                    chrome_set_status(&chrome, status_buf);
+                    chrome_draw_status(&chrome, vc);
+                }
                 break;
             }
 
@@ -279,7 +283,7 @@ static int run_browser(Config *cfg, VideoConfig *vc)
                 break;
 
             case MSG_INTERACTION_MAP:
-                /* TODO Phase 5 */
+                interact_parse_map(&interact, payload_buf, payload_len);
                 break;
 
             default:
@@ -291,7 +295,7 @@ static int run_browser(Config *cfg, VideoConfig *vc)
         {
             KeyEvent key;
             while (input_poll_key(&key)) {
-                /* If URL bar is focused, route keys to chrome */
+                /* Priority 1: URL bar focused → chrome editing */
                 if (chrome.url_focused) {
                     int result = chrome_handle_key(&chrome, key.ascii,
                                                    key.scancode, key.extended);
@@ -312,7 +316,34 @@ static int run_browser(Config *cfg, VideoConfig *vc)
                     continue;
                 }
 
-                /* Global ESC to quit */
+                /* Priority 2: Forwarding mode → send keys to server */
+                if (interact.mode == INTERACT_MODE_FORWARD) {
+                    /* Escape exits forwarding mode */
+                    if (key.ascii == 27) {
+                        interact.mode = INTERACT_MODE_NONE;
+                        interact.forward_elem_id = 0;
+                        chrome_set_status(&chrome, "");
+                        chrome_draw_status(&chrome, vc);
+                        continue;
+                    }
+                    /* Forward key to server */
+                    {
+                        uint8_t kbuf[4];
+                        int klen;
+                        if (key.extended) {
+                            klen = proto_encode_key_event(kbuf,
+                                        key.scancode, 0, 0, 0);
+                        } else {
+                            klen = proto_encode_key_event(kbuf,
+                                        0, key.ascii, 0, 0);
+                        }
+                        net_send_message(&ctx, MSG_KEY_EVENT, kbuf, klen);
+                    }
+                    continue;
+                }
+
+                /* Priority 3: Normal mode - global keys */
+                /* ESC to quit */
                 if (key.ascii == 27) {
                     quit = 1;
                     break;
@@ -375,25 +406,38 @@ static int run_browser(Config *cfg, VideoConfig *vc)
                 send_nav_action(&ctx, NAV_STOP);
                 break;
             case CHROME_HIT_URLBAR:
+                /* Deactivate any content forwarding */
+                interact_deactivate(&interact);
                 chrome_focus_urlbar(&chrome);
                 chrome_draw_urlbar(&chrome, vc);
                 break;
             default:
-                /* Content area click - unfocus URL bar, send to server */
+                /* Content area click - unfocus URL bar */
                 if (chrome.url_focused) {
                     chrome_unfocus_urlbar(&chrome);
                     chrome_draw_urlbar(&chrome, vc);
                 }
-                /* Only send if actually in content area */
+                /* Only process if actually in content area */
                 if (mouse.y > vc->chrome_height &&
                     mouse.y < chrome.status_y) {
                     uint16_t mx = mouse.x;
                     uint16_t my = mouse.y - vc->chrome_height;
-                    uint8_t mbuf[6];
-                    int mlen = proto_encode_mouse_event(mbuf, mx, my,
-                                                        mouse.buttons,
-                                                        MOUSE_CLICK);
-                    net_send_message(&ctx, MSG_MOUSE_EVENT, mbuf, mlen);
+                    InteractElem *elem;
+
+                    /* Check interaction map for hit */
+                    elem = interact_hit_test(&interact, mx, my);
+                    if (elem) {
+                        interact_handle_click(&interact, elem, &ctx,
+                                              mx, my, mouse.buttons);
+                        /* Show status for forwarding mode */
+                        if (interact.mode == INTERACT_MODE_FORWARD) {
+                            chrome_set_status(&chrome, "DIRECT mode (ESC to exit)");
+                            chrome_draw_status(&chrome, vc);
+                        }
+                    } else {
+                        interact_handle_miss(&interact, &ctx,
+                                             mx, my, mouse.buttons);
+                    }
                 }
                 break;
             }
@@ -430,6 +474,15 @@ static int run_browser(Config *cfg, VideoConfig *vc)
         /* 7. Tick cursor blink */
         if (chrome_tick_cursor(&chrome)) {
             chrome_draw_urlbar(&chrome, vc);
+        }
+
+        /* 7b. Update cursor shape based on interaction map */
+        if (mouse.y > vc->chrome_height && mouse.y < chrome.status_y) {
+            interact_update_cursor(&interact, &cursor,
+                                   mouse.x,
+                                   mouse.y - vc->chrome_height);
+        } else {
+            interact_update_cursor(&interact, &cursor, 0xFFFF, 0xFFFF);
         }
 
         /* 8. Save under + draw cursor at new position */

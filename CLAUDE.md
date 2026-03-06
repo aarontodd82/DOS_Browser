@@ -39,7 +39,8 @@ C:\Users\aaron\OneDrive\Documents\DOS_Browser\
 │   │   ├── config.h/c           # RETROSURF.CFG parser (server_ip, video_mode, etc.)
 │   │   ├── input.h/c            # INT 33h mouse, keyboard polling, 30Hz throttle
 │   │   ├── cursor.h/c           # Software cursor (save-under/draw/restore, 4 shapes)
-│   │   └── chrome.h/c           # Address bar, nav buttons [<][>][R][X], status bar
+│   │   ├── chrome.h/c           # Address bar, nav buttons [<][>][R][X], status bar
+│   │   └── interact.h/c        # Interaction map parsing, hit testing, cursor shapes
 │   ├── build/                   # Compiled output (DOSBox-X mounts this as C:)
 │   │   ├── RETRO.EXE            # The compiled DOS executable
 │   │   ├── CWSDPMI.EXE          # DPMI host (must be alongside .EXE)
@@ -100,19 +101,18 @@ and mirrored in `dos_client/src/protocol.h` (C, the client version).
 
 ## What's Done
 
-- **Pi server**: 100% complete, tested on Windows (+ animation detection via rAF/canvas/GIF hooks)
+- **Pi server**: 100% complete, tested on Windows (+ animation detection, input focus cursor blink)
 - **Protocol**: Fully defined and implemented on both sides
 - **DOS dev environment**: DJGPP + Watt-32 + DOSBox-X all working
 - **Phase 1 - Video/Fonts/Config**: VESA mode detection, LFB+banked, palette, BIOS fonts, config file
-- **Phase 2 - Network Rendering**: RLE decompression, XOR delta tiles, frame display (verified with Google.com)
+- **Phase 2 - Network Rendering**: RLE decompression, XOR delta tiles, frame display
 - **Phase 3 - Mouse/Cursor/Input**: INT 33h mouse, software cursor, click/scroll/keyboard events
-- **Phase 4 - Browser Chrome**: Nav buttons, editable URL bar, status bar (colors still need polish)
+- **Phase 4 - Browser Chrome**: Nav buttons, editable URL bar, status bar, correct palette colors
+- **Phase 5 - Interaction Map**: Forwarding mode, cursor shapes (hand/I-beam), hit testing
 
 ## What's Next
 
-1. **Phase 4 polish** - Chrome colors need fixing (see Palette section below)
-2. **Phase 5 - interact.c/h** - Parse INTERACTION_MAP, hit testing, local text editing for form inputs
-3. **Phase 6 - Polish** - Error handling, reconnect, keepalive, CONTINUED flag, double-click
+1. **Phase 6 - Polish** - Error handling, reconnect, keepalive, CONTINUED flag, double-click
 
 ## Palette (IMPORTANT)
 
@@ -126,10 +126,24 @@ The server palette is a 6x6x6 RGB color cube (indices 0-215), NOT CGA colors.
 
 ## CLIENT_HELLO Quirk
 
-The CLIENT_HELLO sends `content_height` as `screen_height` and `chrome_height` as the top bar height.
-The server computes: `viewport = screen_height - chrome_height`. This means the server renders slightly
-fewer rows than the client expects (double subtraction). It works because tile indices still map correctly;
-the bottom ~24px just stays black. Do NOT change this without careful testing - previous attempts broke rendering.
+The CLIENT_HELLO sends `vc->height` (480) as `screen_height` and `chrome_height` (24) as the top bar height.
+The server computes: `viewport = 480 - 24 = 456`. Do NOT change this without careful testing.
+
+## Phase 5 Design Decision: Forwarding Mode (not local editing)
+
+DESIGN.md Section 8.3 describes local text editing (DOS renders text fields locally for zero-latency typing).
+This was attempted and **abandoned** because:
+1. Server frame deltas overwrite locally-drawn text (constant fighting/flicker)
+2. Server's bg_color mapping often returns wrong palette indices (fields turn black)
+3. Complexity wasn't worth it for the marginal latency improvement
+
+Instead, **forwarding mode** is used for ALL editable elements (text inputs, textareas, passwords,
+contenteditable). Keys are sent to the server as KEY_EVENT, and the visual result comes back via
+frame deltas (~50-200ms latency). This is reliable and works everywhere.
+
+**Playwright caret**: Must use `caret='initial'` in `page.screenshot()` — Playwright hides the text
+cursor by default. Also added `__retrosurf_input_focused` JS flag so `check_dirty()` returns true
+while an input has focus (forces periodic frame captures for cursor blink).
 
 ## Important Notes
 

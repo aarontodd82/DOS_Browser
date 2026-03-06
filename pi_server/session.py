@@ -24,6 +24,7 @@ _MUTATION_OBSERVER_JS = '''
 window.__retrosurf_dirty = true;
 window.__retrosurf_scroll_dirty = false;
 window.__retrosurf_has_animation = false;
+window.__retrosurf_input_focused = false;
 
 const observer = new MutationObserver(() => {
     window.__retrosurf_dirty = true;
@@ -48,6 +49,7 @@ history.pushState = function() {
     origPushState.apply(this, arguments);
     window.__retrosurf_dirty = true;
     window.__retrosurf_has_animation = false;
+    window.__retrosurf_input_focused = false;
     setTimeout(startObserving, 100);
 };
 
@@ -61,11 +63,16 @@ window.addEventListener('resize', () => {
 });
 
 // Track focus changes (input field focus triggers visual changes)
-document.addEventListener('focusin', () => {
+document.addEventListener('focusin', (e) => {
     window.__retrosurf_dirty = true;
+    const tag = e.target.tagName;
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || e.target.isContentEditable) {
+        window.__retrosurf_input_focused = true;
+    }
 }, true);
 document.addEventListener('focusout', () => {
     window.__retrosurf_dirty = true;
+    window.__retrosurf_input_focused = false;
 }, true);
 
 // --- Animation detection ---
@@ -370,6 +377,9 @@ class BrowserSession:
                     if (!videos[i].paused && !videos[i].ended) return true;
                 }
 
+                // Text input focused - cursor blink needs periodic updates
+                if (window.__retrosurf_input_focused) return true;
+
                 return false;
             }''')
             if is_dirty:
@@ -393,6 +403,7 @@ class BrowserSession:
             screenshot_bytes = await self.page.screenshot(
                 type='jpeg',
                 quality=self.config.get('screenshot_quality', 70),
+                caret='initial',
             )
         except Exception as e:
             print(f"[Session {self.session_id}] Screenshot failed: {e}")

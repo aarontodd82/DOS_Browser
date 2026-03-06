@@ -80,6 +80,7 @@ int proto_encode_nav_action(uint8_t *buf, uint8_t action)
     return 1;
 }
 
+
 int proto_decode_header(const uint8_t *buf, msg_header_t *header)
 {
     const msg_header_t *src = (const msg_header_t *)buf;
