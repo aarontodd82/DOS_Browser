@@ -202,7 +202,7 @@ static int run_browser(Config *cfg, VideoConfig *vc)
     {
         uint8_t hello_buf[64];
         int payload_size = proto_encode_client_hello(
-            hello_buf, vc->width, vc->content_height,
+            hello_buf, vc->width, vc->height,
             vc->bpp, TILE_SIZE, vc->chrome_height, 32, 0
         );
         rc = net_send_message(&ctx, MSG_CLIENT_HELLO, hello_buf, payload_size);

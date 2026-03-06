@@ -18,9 +18,9 @@
  *   White = 5*36+5*6+5 = 215
  *   Light gray ~= 4*36+4*6+4 = 184 (204,204,204)
  */
-#define COL_BLACK        0    /* (0,0,0) in 6x6x6 cube */
-#define COL_WHITE       215   /* (255,255,255) in 6x6x6 cube */
-#define COL_LIGHT_GRAY  184   /* (204,204,204) in 6x6x6 cube */
+#define COL_BLACK        0    /* (0,0,0) = 0*36+0*6+0 */
+#define COL_WHITE       215   /* (255,255,255) = 5*36+5*6+5 */
+#define COL_LIGHT_GRAY  172   /* (204,204,204) = 4*36+4*6+4 */
 
 #define COL_CHROME_BG    COL_LIGHT_GRAY
 #define COL_CHROME_BORDER COL_BLACK
