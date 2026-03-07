@@ -12,11 +12,30 @@ from image_pipeline import ImagePipeline
 from interaction_detector import detect_interactive_elements
 
 
-# CSS injected into every page to make scrolling instant (no smooth scroll)
+# CSS injected into every page to optimize for low-bandwidth tile streaming.
+# Goals: eliminate animations/transitions (instant appearance), disable
+# blur/transparency effects, hide unplayable media, reduce visual churn.
 _PAGE_CSS = '''
 *, *::before, *::after {
     scroll-behavior: auto !important;
+    animation-duration: 0s !important;
+    animation-delay: 0s !important;
+    transition-duration: 0s !important;
+    transition-delay: 0s !important;
+    backdrop-filter: none !important;
+    -webkit-backdrop-filter: none !important;
 }
+/* Hide video/audio - can't play on DOS */
+video, audio,
+iframe[src*="youtube"], iframe[src*="youtu.be"],
+iframe[src*="vimeo"], iframe[src*="dailymotion"] {
+    visibility: hidden !important;
+    height: 0 !important;
+    min-height: 0 !important;
+    overflow: hidden !important;
+}
+/* Disable heavy visual effects that create lots of dirty tiles */
+*::-webkit-scrollbar { display: none !important; }
 '''
 
 # JavaScript injected to track DOM changes via MutationObserver
@@ -248,10 +267,53 @@ class BrowserSession:
         self.context = await self.browser.new_context(
             viewport={'width': width, 'height': height},
             device_scale_factor=1,
+            reduced_motion='reduce',
+            color_scheme='light',
+            user_agent=(
+                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                'AppleWebKit/537.36 (KHTML, like Gecko) '
+                'Chrome/131.0.0.0 Safari/537.36'
+            ),
         )
         self.page = await self.context.new_page()
 
-        # Inject page CSS (disable smooth scrolling)
+        # Stealth: remove automation indicators before any page JS runs
+        await self.page.add_init_script('''
+            // Remove webdriver flag (the #1 bot detection signal)
+            Object.defineProperty(navigator, 'webdriver', {
+                get: () => undefined
+            });
+
+            // Fake plugins array (real Chrome always has plugins)
+            Object.defineProperty(navigator, 'plugins', {
+                get: () => [
+                    { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer' },
+                    { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai' },
+                    { name: 'Native Client', filename: 'internal-nacl-plugin' },
+                ]
+            });
+
+            // Fake languages (headless often has empty array)
+            Object.defineProperty(navigator, 'languages', {
+                get: () => ['en-US', 'en']
+            });
+
+            // Add window.chrome object (missing in headless)
+            if (!window.chrome) {
+                window.chrome = { runtime: {} };
+            }
+
+            // Fix permissions query (headless returns different results)
+            const origQuery = window.navigator.permissions?.query;
+            if (origQuery) {
+                window.navigator.permissions.query = (params) =>
+                    params.name === 'notifications'
+                        ? Promise.resolve({ state: Notification.permission })
+                        : origQuery.call(window.navigator.permissions, params);
+            }
+        ''')
+
+        # Inject page CSS (kill animations, transitions, effects)
         await self.page.add_init_script(f'''
             const style = document.createElement('style');
             style.textContent = `{_PAGE_CSS}`;
@@ -288,6 +350,8 @@ class BrowserSession:
         self._last_scroll_y = 0
         self._nav_burst_until = time.time() + 3.0
         self.last_activity = time.time()
+        if self.pipeline:
+            self.pipeline.prev_indexed = None
 
         # Add https:// if no scheme provided
         if not url.startswith(('http://', 'https://', 'file://')):
@@ -312,6 +376,8 @@ class BrowserSession:
         self._interaction_dirty = True
         self._last_scroll_y = 0
         self._nav_burst_until = time.time() + 3.0
+        if self.pipeline:
+            self.pipeline.prev_indexed = None
         try:
             await self.page.go_back(wait_until='domcontentloaded', timeout=15000)
             self.current_url = self.page.url
@@ -325,6 +391,8 @@ class BrowserSession:
         self._interaction_dirty = True
         self._last_scroll_y = 0
         self._nav_burst_until = time.time() + 3.0
+        if self.pipeline:
+            self.pipeline.prev_indexed = None
         try:
             await self.page.go_forward(wait_until='domcontentloaded', timeout=15000)
             self.current_url = self.page.url
@@ -339,6 +407,8 @@ class BrowserSession:
         self._interaction_dirty = True
         self._last_scroll_y = 0
         self._nav_burst_until = time.time() + 3.0
+        if self.pipeline:
+            self.pipeline.prev_indexed = None
         try:
             await self.page.reload(wait_until='domcontentloaded', timeout=30000)
         except Exception:

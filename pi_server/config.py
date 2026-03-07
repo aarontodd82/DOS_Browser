@@ -20,6 +20,20 @@ DEFAULT_CONFIG = {
         '--disable-background-networking',
         '--disable-sync',
         '--disable-translate',
+        '--disable-smooth-scrolling',
+        '--disable-default-apps',
+        '--disable-component-update',
+        '--force-color-profile=srgb',
+        '--autoplay-policy=user-gesture-required',
+        # Anti-bot-detection: remove automation indicators
+        '--disable-blink-features=AutomationControlled',
+        # Force 1:1 pixel scaling (ignore Windows DPI scaling)
+        '--force-device-scale-factor=1',
+        '--high-dpi-support=0',
+        # Don't throttle when minimized/background
+        '--disable-renderer-backgrounding',
+        '--disable-backgrounding-occluded-windows',
+        '--disable-hang-monitor',
     ],
 }
 

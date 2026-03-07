@@ -51,14 +51,25 @@ class RetroSurfServer:
         """Launch the browser and start the TCP server."""
         print("Starting RetroSurf server...")
 
-        # Launch Playwright + Chromium
-        print("Launching headless Chromium...")
+        # Launch real Chrome (headed) to avoid bot detection.
+        # Uses your installed Chrome instead of Playwright's bundled Chromium.
+        # A Chrome window will appear — minimize it, don't close it.
+        print("Launching Chrome (headed)...")
         self.playwright = await async_playwright().start()
-        self.browser = await self.playwright.chromium.launch(
-            headless=True,
-            args=self.config.get('chromium_args', []),
-        )
-        print("Chromium ready.")
+        try:
+            self.browser = await self.playwright.chromium.launch(
+                headless=False,
+                channel='chrome',
+                args=self.config.get('chromium_args', []),
+            )
+            print("Chrome (real) ready.")
+        except Exception as e:
+            print(f"Real Chrome not available ({e}), falling back to bundled Chromium...")
+            self.browser = await self.playwright.chromium.launch(
+                headless=False,
+                args=self.config.get('chromium_args', []),
+            )
+            print("Chromium (headed) ready.")
 
         # Start session cleanup task
         asyncio.create_task(self._cleanup_sessions_loop())
@@ -263,7 +274,8 @@ class RetroSurfServer:
             if result:
                 tiles, scroll_dy = result
                 if tiles:
-                    await self._send_tiles(writer, tiles, seq, scroll_dy=scroll_dy)
+                    await self._send_tiles(writer, tiles, seq,
+                                           scroll_dy=scroll_dy)
                     frame_sent = True
                     empty_frames = 0
                 else:

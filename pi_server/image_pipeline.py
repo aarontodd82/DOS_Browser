@@ -193,7 +193,11 @@ class ImagePipeline:
         self.frame_count = 0
 
     def process_frame(self, image_input, scroll_dy=0):
-        """Process a screenshot into compressed delta tiles.
+        """Process a screenshot into compressed raw tiles.
+
+        Only changed tiles are sent (detected by comparing with prev_indexed).
+        Tile data is raw palette indices, NOT XOR'd — eliminates the entire
+        class of client/server state desync bugs.
 
         Args:
             image_input: one of:
@@ -202,8 +206,8 @@ class ImagePipeline:
               - numpy array: (H, W, 3) uint8 RGB
             scroll_dy: vertical scroll delta in pixels since last frame.
                 Positive = scrolled down (content moved up).
-                If tile-aligned, prev_indexed is shifted before XOR
-                to minimize changed tiles.
+                If tile-aligned, prev_indexed is shifted to minimize
+                the number of changed tiles detected.
 
         Returns:
             list of (tile_index, compressed_bytes) tuples for changed tiles.
@@ -227,14 +231,14 @@ class ImagePipeline:
         if self.prev_indexed is not None and scroll_dy != 0 and scroll_dy % self.tile_size == 0:
             self.prev_indexed = self._shift_prev(self.prev_indexed, scroll_dy)
 
-        # Find changed tiles and compress them
+        # Find changed tiles
         if self.prev_indexed is None:
-            # First frame: all tiles changed
+            # First frame or after navigation: all tiles changed
             changed_indices = list(range(self.tile_cols * self.tile_rows))
         else:
             changed_indices = self._find_changed_tiles(indexed)
 
-        # Build compressed delta tiles
+        # Build compressed raw tiles (no XOR — just raw palette indices)
         result = []
         total_raw = 0
         total_compressed = 0
@@ -247,15 +251,8 @@ class ImagePipeline:
             y1 = min(y0 + self.tile_size, self.height)
             x1 = min(x0 + self.tile_size, self.width)
 
-            new_tile = indexed[y0:y1, x0:x1]
-
-            if self.prev_indexed is not None:
-                old_tile = self.prev_indexed[y0:y1, x0:x1]
-                delta = np.bitwise_xor(new_tile, old_tile)
-            else:
-                delta = new_tile.copy()
-
-            raw_bytes = delta.tobytes()
+            tile_data = indexed[y0:y1, x0:x1]
+            raw_bytes = tile_data.tobytes()
             compressed = rle_compress(raw_bytes)
 
             total_raw += len(raw_bytes)
@@ -263,7 +260,7 @@ class ImagePipeline:
 
             result.append((tile_idx, compressed))
 
-        # Update previous frame
+        # Update previous frame (for change detection only, not for XOR)
         self.prev_indexed = indexed.copy()
         self.frame_count += 1
 

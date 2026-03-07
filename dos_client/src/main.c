@@ -272,10 +272,8 @@ static int run_browser(Config *cfg, VideoConfig *vc, net_context_t *passed_ctx)
             switch (header.msg_type) {
             case MSG_FRAME_FULL:
             case MSG_FRAME_DELTA:
-                /* Shift prev_tiles AND backbuffer to match server's scroll-aware delta */
-                if (header.reserved != 0 &&
-                    header.msg_type == MSG_FRAME_DELTA) {
-                    render_shift_prev(&render, header.reserved);
+                /* Shift backbuffer to match server's scroll optimization */
+                if (header.reserved != 0) {
                     video_shift_content(vc, header.reserved, 0);
                     vc->full_flush = 1;
                 }

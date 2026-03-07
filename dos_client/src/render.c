@@ -7,7 +7,8 @@
  *   Literal: next <length> bytes are pixel values
  *   Repeat: next 1 byte repeated <length> times
  *
- * XOR delta: decoded tile XORed with previous tile to reconstruct current.
+ * Tiles are raw palette-indexed pixels (no XOR delta).
+ * Only changed tiles are sent by the server.
  */
 
 #include <stdio.h>
@@ -54,24 +55,11 @@ static int rle_decode(const uint8_t *src, uint16_t comp_size,
     return dst - dst_start;
 }
 
-/* Decode a single tile: RLE decompress, XOR with previous, update previous.
- * prev_tile is both input (previous frame) and output (updated to current). */
-static void decode_tile(const uint8_t *compressed, uint16_t comp_size,
-                        uint8_t *prev_tile)
+/* Decode a single tile: RLE decompress into tile_temp. */
+static void decode_tile(const uint8_t *compressed, uint16_t comp_size)
 {
-    int i;
-
-    /* RLE decode into temp buffer */
     memset(tile_temp, 0, TILE_PIXELS);
     rle_decode(compressed, comp_size, tile_temp, TILE_PIXELS);
-
-    /* XOR with previous tile to reconstruct current */
-    for (i = 0; i < TILE_PIXELS; i++) {
-        tile_temp[i] ^= prev_tile[i];
-    }
-
-    /* Update previous tile cache */
-    memcpy(prev_tile, tile_temp, TILE_PIXELS);
 }
 
 /* Blit a 16x16 tile from tile data to the backbuffer at (dst_x, dst_y) */
@@ -103,18 +91,7 @@ int render_init(RenderContext *rc, VideoConfig *vc)
     rc->rows = vc->tile_rows;
     rc->total = vc->tile_total;
 
-    /* Allocate previous tile buffer */
-    rc->prev_tiles = (uint8_t *)malloc((uint32_t)rc->total * TILE_PIXELS);
-    if (!rc->prev_tiles) {
-        printf("ERROR: Cannot allocate tile buffer (%lu bytes)\n",
-               (unsigned long)rc->total * TILE_PIXELS);
-        return -1;
-    }
-    memset(rc->prev_tiles, 0, (uint32_t)rc->total * TILE_PIXELS);
-
-    printf("Render: %ux%u tiles, tile buffer=%luKB\n",
-           rc->cols, rc->rows,
-           (unsigned long)(rc->total * TILE_PIXELS) / 1024);
+    printf("Render: %ux%u tiles\n", rc->cols, rc->rows);
 
     return 0;
 }
@@ -136,7 +113,6 @@ void render_apply_frame(RenderContext *rc, VideoConfig *vc,
         uint16_t tile_index, comp_size;
         uint16_t tile_col, tile_row;
         uint16_t dst_x, dst_y;
-        uint8_t *prev;
 
         /* Read tile entry header */
         if (ptr + 4 > payload + payload_len) break;
@@ -155,9 +131,8 @@ void render_apply_frame(RenderContext *rc, VideoConfig *vc,
         }
         if (ptr + comp_size > payload + payload_len) break;
 
-        /* Decode tile (RLE + XOR delta) */
-        prev = rc->prev_tiles + (uint32_t)tile_index * TILE_PIXELS;
-        decode_tile(ptr, comp_size, prev);
+        /* Decode tile (RLE decompress — no XOR) */
+        decode_tile(ptr, comp_size);
 
         /* Calculate screen position (content area starts below chrome) */
         tile_col = tile_index % rc->cols;
@@ -166,7 +141,7 @@ void render_apply_frame(RenderContext *rc, VideoConfig *vc,
         dst_y = tile_row * TILE_SIZE + vc->chrome_height;
 
         /* Blit tile to backbuffer */
-        blit_tile(prev, vc, dst_x, dst_y);
+        blit_tile(tile_temp, vc, dst_x, dst_y);
 
         /* Mark dirty for VGA flush */
         video_mark_dirty(vc, dst_x, dst_y, TILE_SIZE, TILE_SIZE);
@@ -175,51 +150,7 @@ void render_apply_frame(RenderContext *rc, VideoConfig *vc,
     }
 }
 
-void render_shift_prev(RenderContext *rc, int16_t scroll_dy)
-{
-    int tile_shift, src_start, dst_start, count;
-
-    if (scroll_dy == 0 || scroll_dy % TILE_SIZE != 0) return;
-    if (!rc->prev_tiles) return;
-
-    tile_shift = scroll_dy / TILE_SIZE;  /* positive = shift up */
-
-    if (tile_shift > 0) {
-        /* Content moved up: shift tile rows up */
-        src_start = tile_shift * rc->cols;
-        if (src_start >= rc->total) return;
-        count = rc->total - src_start;
-        memmove(rc->prev_tiles,
-                rc->prev_tiles + (uint32_t)src_start * TILE_PIXELS,
-                (uint32_t)count * TILE_PIXELS);
-        /* Clear exposed bottom rows */
-        memset(rc->prev_tiles + (uint32_t)count * TILE_PIXELS,
-               0, (uint32_t)src_start * TILE_PIXELS);
-    } else {
-        /* Content moved down: shift tile rows down */
-        int abs_shift = -tile_shift;
-        dst_start = abs_shift * rc->cols;
-        if (dst_start >= rc->total) return;
-        count = rc->total - dst_start;
-        memmove(rc->prev_tiles + (uint32_t)dst_start * TILE_PIXELS,
-                rc->prev_tiles,
-                (uint32_t)count * TILE_PIXELS);
-        /* Clear exposed top rows */
-        memset(rc->prev_tiles, 0, (uint32_t)dst_start * TILE_PIXELS);
-    }
-}
-
-void render_reset(RenderContext *rc)
-{
-    if (rc->prev_tiles) {
-        memset(rc->prev_tiles, 0, (uint32_t)rc->total * TILE_PIXELS);
-    }
-}
-
 void render_shutdown(RenderContext *rc)
 {
-    if (rc->prev_tiles) {
-        free(rc->prev_tiles);
-        rc->prev_tiles = NULL;
-    }
+    (void)rc;
 }
