@@ -182,7 +182,33 @@ and mirrored in `dos_client/src/protocol.h` (C, the client version).
 ## What's Next
 
 1. **Polish** - Error handling, reconnect on disconnect, keepalive, double-click
-2. **YouTube mode** - Low-res video/audio streaming to DOS (future exploration)
+
+## Future Roadmap
+
+### High Priority
+- **Copy/paste** - Clipboard sync between DOS and server
+- **File uploads** - DOS file -> server -> browser upload dialog
+- **File downloads** - Browser download -> server -> DOS file
+- **Right-click context menus** - Send right-click to server, render result
+- **YouTube mode** - Low-res video/audio streaming to DOS (Sound Blaster audio)
+
+### Medium Priority
+- **Multiple tabs** - Tab bar UI, memory management
+- **Bookmarks** - Local file on DOS machine
+- **Browsing history** - Local file on DOS machine
+- **Find on page (Ctrl+F)** - Server-side search + highlight
+- **Keyboard shortcuts** - Configurable via RETRO.CFG
+- **Reader mode** - Strip page to text content, render at DOS-native text resolution
+
+### Low Priority / Experimental
+- **Drag and drop** - Complex coordinate tracking
+- **Print** - Server renders to printable format
+- **Image zoom** - Click to zoom into a region at higher resolution
+- **Tile priority** - Send tiles near the cursor first for perceived responsiveness
+- **Adaptive JPEG quality** - Lower quality during fast scrolling, higher when static
+- **Sound alerts** - PC speaker beep for notifications/errors
+- **Theme support** - Multiple DOS-side color schemes (amber, green, blue terminal)
+- **Server web admin panel** - Configure server settings from any browser
 
 ## Palette (IMPORTANT)
 
@@ -214,6 +240,37 @@ result comes back via frame data (~50-200ms latency). This is reliable and works
 **Playwright caret**: Must use `caret='initial'` in `page.screenshot()` -- Playwright hides
 the text cursor by default. Also added `__retrosurf_input_focused` JS flag so `check_dirty()`
 returns true while an input has focus (forces periodic frame captures for cursor blink).
+
+## Performance Reference
+
+### Network Bandwidth (NE2000 on 25MHz 486: ~300-400 KB/s)
+
+| Scenario | Compressed Size | Time @ 350 KB/s |
+|----------|----------------|-----------------|
+| Full frame (all tiles) | ~150-250 KB | 0.4-0.7s |
+| Scroll (40% tiles) | ~60-100 KB | 170-285ms |
+| Small interaction (10%) | ~15-25 KB | 43-71ms |
+| Typing feedback (5%) | ~8-13 KB | 23-37ms |
+| Hover (2-3 tiles) | ~1-2 KB | 3-6ms |
+
+### Memory Budget (640x480 mode, ~3200 KB usable)
+
+| Allocation | Size (KB) |
+|------------|-----------|
+| Program code + Watt-32 | ~200 |
+| Backbuffer (640x480x8) | 307 |
+| TCP receive buffer | 48 |
+| Network recv_buf | 65 |
+| Payload buffer | 65 |
+| Interaction map | 20 |
+| Fonts, cursor, config, misc | ~50 |
+| **Total used** | **~755** |
+| **Remaining** | **~2445** |
+
+### End-to-End Latency (user action -> visual update on DOS)
+- Best case (small change): ~150ms
+- Typical: ~200-300ms
+- Full page load: ~700-1000ms
 
 ## Important Design Decisions
 
