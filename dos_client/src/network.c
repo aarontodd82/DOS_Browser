@@ -18,6 +18,13 @@
 /* Watt-32 TCP socket */
 static tcp_Socket tcp_sock;
 
+/* Large receive buffer for high-throughput frame streaming.
+ * Default Watt-32 rx buffer is small (~2KB), causing TCP window
+ * stalls when receiving large frames. 48KB allows the server to
+ * send a full frame without waiting for ACKs mid-transfer. */
+#define BIG_RX_BUF_SIZE  49152
+static uint8_t big_rx_buf[BIG_RX_BUF_SIZE];
+
 int net_init(void)
 {
     int rc;
@@ -91,7 +98,15 @@ int net_connect(net_context_t *ctx, const char *server_ip, uint16_t port)
                 ctx->state = NET_CONNECTED;
                 ctx->recv_pos = 0;
                 ctx->recv_need = HEADER_SIZE;
+
+                /* Enlarge TCP receive buffer for high throughput.
+                 * This also increases the TCP window advertised to
+                 * the server, letting it send more data at once. */
+                sock_setbuf((sock_type *)&tcp_sock, big_rx_buf,
+                            BIG_RX_BUF_SIZE);
+
                 printf("Connected after %d ticks!\n", tick_count);
+                printf("TCP rx buffer: %d bytes\n", BIG_RX_BUF_SIZE);
                 return 0;
             }
 
@@ -246,4 +261,9 @@ int net_recv_message(net_context_t *ctx, msg_header_t *header,
 void net_poll(void)
 {
     tcp_tick(NULL);
+}
+
+int net_data_ready(void)
+{
+    return sock_dataready(&tcp_sock) > 0 ? 1 : 0;
 }

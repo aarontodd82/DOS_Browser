@@ -165,10 +165,14 @@ class RetroSurfServer:
             print(f"[Server] Handshake complete. Entering main loop.")
 
             # --- Main Loop ---
+            # ACK event gates frame delivery: set initially so first frame sends
+            frame_ack_event = asyncio.Event()
+            frame_ack_event.set()
+
             # Run push and receive loops concurrently
             await asyncio.gather(
-                self._push_loop(writer, session, seq),
-                self._receive_loop(reader, writer, session, seq),
+                self._push_loop(writer, session, seq, frame_ack_event),
+                self._receive_loop(reader, writer, session, seq, frame_ack_event),
             )
 
         except asyncio.IncompleteReadError:
@@ -189,56 +193,107 @@ class RetroSurfServer:
                 pass
             print(f"[Server] Client {addr} connection closed")
 
-    async def _push_loop(self, writer, session, seq):
-        """Continuously push frame updates and interaction maps to the client."""
-        frame_interval = self.config.get('frame_check_interval_ms', 50) / 1000.0
+    async def _push_loop(self, writer, session, seq, frame_ack_event):
+        """Frame push loop — streams as fast as the client can receive.
+
+        Two modes:
+        - ACTIVE: Recent frames had tile changes. Capture immediately after
+          each ACK with zero delay. This maximizes throughput during page
+          loads and content changes.
+        - IDLE: No tile changes for several frames. Poll for dirty state
+          with short intervals to avoid wasting CPU on screenshots.
+        """
         interaction_interval = self.config.get('interaction_scan_interval_ms', 500) / 1000.0
         status_interval = self.config.get('status_update_interval_ms', 2000) / 1000.0
-
+        ack_timeout = 10.0
         last_interaction_time = 0
         last_status_time = 0
 
+        # After this many consecutive frames with no tile changes,
+        # switch from active to idle (polling) mode
+        IDLE_THRESHOLD = 3
+        empty_frames = 0
+
         while True:
-            await asyncio.sleep(frame_interval)
-
-            # Check if page content has changed
+            # Wait for client ACK (or timeout as safety net)
             try:
-                is_dirty = await session.check_dirty()
-            except Exception:
-                continue
+                await asyncio.wait_for(frame_ack_event.wait(), timeout=ack_timeout)
+            except asyncio.TimeoutError:
+                pass
+            frame_ack_event.clear()
 
-            if is_dirty:
-                # Capture and send frame delta (with scroll optimization)
-                result = await session.capture_frame()
-                if result:
-                    tiles, scroll_dy = result
-                    if tiles:
-                        await self._send_tiles(writer, tiles, seq,
-                                               scroll_dy=scroll_dy)
+            # IDLE MODE: poll for dirty state before capturing
+            if empty_frames >= IDLE_THRESHOLD:
+                loop = asyncio.get_event_loop()
+                deadline = loop.time() + ack_timeout
+                is_dirty = False
+                while not is_dirty and loop.time() < deadline:
+                    try:
+                        is_dirty = await session.check_dirty()
+                    except Exception:
+                        is_dirty = False
+                    if is_dirty:
+                        break
 
-            # Periodically update interaction map
+                    # Send non-frame updates while waiting
+                    now = time.time()
+                    if now - last_interaction_time > interaction_interval:
+                        try:
+                            elements, sy, sh = await session.get_interaction_map()
+                            map_payload = encode_interaction_map(elements, sy, sh)
+                            await self._send_message(writer, MSG_INTERACTION_MAP, map_payload, seq)
+                        except Exception:
+                            pass
+                        last_interaction_time = now
+                    if now - last_status_time > status_interval:
+                        try:
+                            status_text = await session.get_status_text()
+                            await self._send_message(writer, MSG_STATUS, encode_status(status_text), seq)
+                        except Exception:
+                            pass
+                        last_status_time = now
+
+                    await asyncio.sleep(0.01)  # 10ms poll (was 50ms)
+
+            # ACTIVE MODE: capture immediately, no delay
+
+            # Capture and send frame
+            frame_sent = False
+            result = await session.capture_frame()
+            if result:
+                tiles, scroll_dy = result
+                if tiles:
+                    await self._send_tiles(writer, tiles, seq, scroll_dy=scroll_dy)
+                    frame_sent = True
+                    empty_frames = 0
+                else:
+                    empty_frames += 1
+            else:
+                empty_frames += 1
+
+            # If no frame was sent, don't wait for an ACK
+            if not frame_sent:
+                frame_ack_event.set()
+
+            # Periodic non-frame updates
             now = time.time()
             if now - last_interaction_time > interaction_interval:
                 try:
-                    elements, scroll_y, scroll_height = await session.get_interaction_map()
-                    map_payload = encode_interaction_map(elements, scroll_y, scroll_height)
-                    await self._send_message(writer, MSG_INTERACTION_MAP,
-                                             map_payload, seq)
+                    elements, sy, sh = await session.get_interaction_map()
+                    map_payload = encode_interaction_map(elements, sy, sh)
+                    await self._send_message(writer, MSG_INTERACTION_MAP, map_payload, seq)
                 except Exception:
                     pass
                 last_interaction_time = now
-
-            # Periodically update status bar
             if now - last_status_time > status_interval:
                 try:
                     status_text = await session.get_status_text()
-                    await self._send_message(writer, MSG_STATUS,
-                                             encode_status(status_text), seq)
+                    await self._send_message(writer, MSG_STATUS, encode_status(status_text), seq)
                 except Exception:
                     pass
                 last_status_time = now
 
-    async def _receive_loop(self, reader, writer, session, seq):
+    async def _receive_loop(self, reader, writer, session, seq, frame_ack_event):
         """Process incoming messages from the DOS client."""
         while True:
             # Read message header
@@ -293,7 +348,7 @@ class RetroSurfServer:
                 await self._send_message(writer, MSG_KEEPALIVE_ACK, b'', seq)
 
             elif msg_type == MSG_ACK:
-                pass  # Acknowledgment received, nothing to do
+                frame_ack_event.set()
 
     async def _handle_mouse(self, session, payload):
         """Process a mouse event from the client."""

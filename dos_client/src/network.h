@@ -76,4 +76,8 @@ int net_recv_message(net_context_t *ctx, msg_header_t *header,
  * Drives the Watt-32 TCP/IP stack. */
 void net_poll(void);
 
+/* Check if TCP data is available for reading.
+ * Returns 1 if data ready, 0 if not. */
+int net_data_ready(void);
+
 #endif /* RETROSURF_NETWORK_H */

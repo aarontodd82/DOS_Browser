@@ -227,6 +227,9 @@ static int run_browser(Config *cfg, VideoConfig *vc, net_context_t *passed_ctx)
     video_flush_full(vc);
 
     /* === Main Loop === */
+    {
+    int frame_received = 0;
+    int had_activity = 0;
     while (!quit) {
 
         /* 1. Poll mouse position */
@@ -236,24 +239,36 @@ static int run_browser(Config *cfg, VideoConfig *vc, net_context_t *passed_ctx)
         cursor_restore(&cursor, vc->backbuffer, vc->width,
                        vc->width, vc->height);
 
-        /* 3. Process network messages */
+        /* 3. Process network messages — stay in tight loop until drained.
+         * For partial messages, keep retrying with a progress check:
+         * allow up to 50 retries with no new data (network stall),
+         * but reset the counter whenever data actually arrives.
+         * This handles 10Mbps links where a 50KB frame takes ~40ms. */
         net_poll();
         {
         int recv_retries = 0;
+        int prev_recv_pos = 0;
         while (1) {
+            prev_recv_pos = ctx.recv_pos;
             rc = net_recv_message(&ctx, &header, payload_buf, &payload_len);
             if (rc < 0) { quit = 1; break; }
             if (rc == 0) {
                 /* No data yet - if mid-message, pump TCP and retry */
-                if (ctx.recv_pos > 0 && recv_retries < 10) {
-                    net_poll();
-                    recv_retries++;
-                    continue;
+                if (ctx.recv_pos > 0) {
+                    if (ctx.recv_pos > prev_recv_pos) {
+                        recv_retries = 0; /* progress - reset */
+                    }
+                    if (recv_retries < 50) {
+                        net_poll();
+                        recv_retries++;
+                        continue;
+                    }
                 }
                 break;
             }
             recv_retries = 0;
 
+            had_activity = 1;
             switch (header.msg_type) {
             case MSG_FRAME_FULL:
             case MSG_FRAME_DELTA:
@@ -265,6 +280,10 @@ static int run_browser(Config *cfg, VideoConfig *vc, net_context_t *passed_ctx)
                     vc->full_flush = 1;
                 }
                 render_apply_frame(&render, vc, payload_buf, payload_len);
+                /* Mark frame complete when last chunk (no CONTINUED flag) */
+                if (!(header.flags & FLAG_CONTINUED)) {
+                    frame_received = 1;
+                }
                 break;
 
             case MSG_PALETTE:
@@ -296,6 +315,14 @@ static int run_browser(Config *cfg, VideoConfig *vc, net_context_t *passed_ctx)
                 break;
             }
         }
+        }
+
+        /* Send FRAME_ACK immediately after receiving — BEFORE VGA flush.
+         * This lets the server start capturing the next frame while we
+         * render the current one to VGA (pipelining). */
+        if (frame_received) {
+            net_send_message(&ctx, MSG_ACK, NULL, 0);
+            frame_received = 0;
         }
 
         /* Extra TCP processing to keep ACKs flowing */
@@ -520,6 +547,17 @@ static int run_browser(Config *cfg, VideoConfig *vc, net_context_t *passed_ctx)
 
         /* 10. Flush dirty regions to VGA */
         video_flush_dirty(vc);
+
+        /* 11. Idle delay: reduce CPU waste when nothing is happening */
+        if (!had_activity) {
+            int i;
+            for (i = 0; i < 5; i++) {
+                net_poll();
+                if (net_data_ready()) break;
+            }
+        }
+        had_activity = 0;
+    }
     }
 
 disconnect:

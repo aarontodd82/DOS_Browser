@@ -31,16 +31,22 @@ const observer = new MutationObserver(() => {
 });
 
 const startObserving = () => {
-    if (document.body) {
-        observer.observe(document.body, {
-            childList: true,
-            attributes: true,
-            characterData: true,
-            subtree: true
+    const target = document.body || document.documentElement;
+    if (target) {
+        observer.observe(target, {
+            childList: true, attributes: true,
+            characterData: true, subtree: true
+        });
+    } else {
+        document.addEventListener('DOMContentLoaded', () => {
+            const t = document.body || document.documentElement;
+            if (t) observer.observe(t, {
+                childList: true, attributes: true,
+                characterData: true, subtree: true
+            });
         });
     }
 };
-
 startObserving();
 
 // Re-attach observer after navigation (SPA pushState)
@@ -230,6 +236,7 @@ class BrowserSession:
         self._dirty = True
         self._interaction_dirty = True
         self._last_scroll_y = 0
+        self._nav_burst_until = 0
 
     async def configure_viewport(self, width, height, color_depth, tile_size):
         """Set up the browser context and page at the requested viewport size."""
@@ -279,6 +286,7 @@ class BrowserSession:
         self._dirty = True
         self._interaction_dirty = True
         self._last_scroll_y = 0
+        self._nav_burst_until = time.time() + 3.0
         self.last_activity = time.time()
 
         # Add https:// if no scheme provided
@@ -303,6 +311,7 @@ class BrowserSession:
         self._dirty = True
         self._interaction_dirty = True
         self._last_scroll_y = 0
+        self._nav_burst_until = time.time() + 3.0
         try:
             await self.page.go_back(wait_until='domcontentloaded', timeout=15000)
             self.current_url = self.page.url
@@ -315,6 +324,7 @@ class BrowserSession:
         self._dirty = True
         self._interaction_dirty = True
         self._last_scroll_y = 0
+        self._nav_burst_until = time.time() + 3.0
         try:
             await self.page.go_forward(wait_until='domcontentloaded', timeout=15000)
             self.current_url = self.page.url
@@ -328,6 +338,7 @@ class BrowserSession:
         self._dirty = True
         self._interaction_dirty = True
         self._last_scroll_y = 0
+        self._nav_burst_until = time.time() + 3.0
         try:
             await self.page.reload(wait_until='domcontentloaded', timeout=30000)
         except Exception:
@@ -356,6 +367,9 @@ class BrowserSession:
              playing videos) which don't trigger MutationObserver
         """
         if self._dirty:
+            return True
+
+        if time.time() < self._nav_burst_until:
             return True
 
         try:
