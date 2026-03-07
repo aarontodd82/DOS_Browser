@@ -238,10 +238,21 @@ static int run_browser(Config *cfg, VideoConfig *vc, net_context_t *passed_ctx)
 
         /* 3. Process network messages */
         net_poll();
+        {
+        int recv_retries = 0;
         while (1) {
             rc = net_recv_message(&ctx, &header, payload_buf, &payload_len);
             if (rc < 0) { quit = 1; break; }
-            if (rc == 0) break;
+            if (rc == 0) {
+                /* No data yet - if mid-message, pump TCP and retry */
+                if (ctx.recv_pos > 0 && recv_retries < 10) {
+                    net_poll();
+                    recv_retries++;
+                    continue;
+                }
+                break;
+            }
+            recv_retries = 0;
 
             switch (header.msg_type) {
             case MSG_FRAME_FULL:
@@ -285,6 +296,10 @@ static int run_browser(Config *cfg, VideoConfig *vc, net_context_t *passed_ctx)
                 break;
             }
         }
+        }
+
+        /* Extra TCP processing to keep ACKs flowing */
+        net_poll();
 
         /* 4. Handle keyboard */
         {
@@ -500,7 +515,10 @@ static int run_browser(Config *cfg, VideoConfig *vc, net_context_t *passed_ctx)
             }
         }
 
-        /* 9. Flush dirty regions to VGA */
+        /* 9. Pump TCP before flush to keep ACKs flowing */
+        net_poll();
+
+        /* 10. Flush dirty regions to VGA */
         video_flush_dirty(vc);
     }
 
