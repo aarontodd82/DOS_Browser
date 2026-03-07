@@ -2,45 +2,45 @@
 
 ## What This Project Is
 
-RetroSurf is a web browser for DOS 6.22 that uses a Raspberry Pi 4 as a rendering proxy. The Pi runs headless Chromium, captures screenshots, compresses them to 256-color tiled frames, and streams them over TCP to a DOS thin client. The DOS client displays the frames, handles mouse/keyboard input, and sends interactions back to the Pi.
+RetroSurf is a web browser for DOS 6.22 that uses a rendering proxy (Raspberry Pi 4 or Windows PC). The proxy runs real Chrome (headed, not headless) via Playwright, captures screenshots, compresses them to 256-color RLE tiles, and streams them over TCP to a DOS thin client. The DOS client displays the frames, handles mouse/keyboard input, and sends interactions back to the server.
 
 Target hardware: 25MHz 486, 4MB RAM, NE2000 Ethernet, VGA/VESA display.
 
-Full design: `DESIGN.md` (2200+ lines, covers everything).
+Historical design document: `DESIGN.md` — many sections are outdated. This file (CLAUDE.md) is the current source of truth.
 
 ## Project Layout
 
 ```
 C:\Users\aaron\OneDrive\Documents\DOS_Browser\
-├── DESIGN.md                    # Full design document (the source of truth)
-├── CLAUDE.md                    # This file
+├── DESIGN.md                    # Historical design doc (outdated in many areas)
+├── CLAUDE.md                    # This file - current source of truth
 │
-├── pi_server/                   # COMPLETE - Python rendering server
-│   ├── server.py                # Asyncio TCP server, push/receive loops
-│   ├── session.py               # BrowserSession (Playwright page lifecycle)
-│   ├── image_pipeline.py        # Bayer dither, LUT, tile, XOR delta, RLE
+├── pi_server/                   # Python rendering server
+│   ├── server.py                # Asyncio TCP server, ACK-paced push/receive loops
+│   ├── session.py               # BrowserSession (Playwright, stealth, CSS injection)
+│   ├── image_pipeline.py        # Bayer dither, LUT, tile change detection, RLE
 │   ├── palette.py               # 256/16 color palettes, 3D LUT builder
 │   ├── protocol.py              # Binary protocol encode/decode (THE reference)
 │   ├── interaction_detector.py  # JS-based interactive element detection
-│   ├── config.py                # Config loader with defaults
+│   ├── config.py                # Config loader with defaults + Chromium args
 │   ├── test_pipeline.py         # Visual quality tests
 │   ├── test_client.py           # Simulated DOS client for e2e testing
 │   ├── requirements.txt         # playwright, Pillow, numpy
 │   └── setup.bat                # Windows venv setup
 │
-├── dos_client/                  # IN PROGRESS - C DOS client
+├── dos_client/                  # C DOS client (DJGPP cross-compiled)
 │   ├── src/
 │   │   ├── main.c               # Full browser main loop (splash, connect, render, input)
 │   │   ├── protocol.h/c         # C port of protocol.py (packed structs, encode/decode)
-│   │   ├── network.h/c          # Watt-32 TCP (connect, send, non-blocking recv)
+│   │   ├── network.h/c          # Watt-32 TCP (connect, send, non-blocking recv, 48KB rx buf)
 │   │   ├── video.h/c            # VESA/VGA mode setting, LFB/banked, backbuffer, palette
-│   │   ├── render.h/c           # RLE decompress, XOR delta, tile grid, blit to backbuffer
+│   │   ├── render.h/c           # RLE decompress, tile blit to backbuffer (NO XOR)
 │   │   ├── font.h/c             # BIOS ROM fonts (8x8, 8x14, 8x16), string drawing
 │   │   ├── config.h/c           # RETROSURF.CFG parser (server_ip, video_mode, etc.)
 │   │   ├── input.h/c            # INT 33h mouse, keyboard polling, 30Hz throttle
 │   │   ├── cursor.h/c           # Software cursor (save-under/draw/restore, 4 shapes)
 │   │   ├── chrome.h/c           # Address bar, nav buttons [<][>][R][X], status bar
-│   │   └── interact.h/c        # Interaction map parsing, hit testing, cursor shapes
+│   │   └── interact.h/c         # Interaction map parsing, hit testing, cursor shapes
 │   ├── build/                   # Compiled output (DOSBox-X mounts this as C:)
 │   │   ├── RETRO.EXE            # The compiled DOS executable
 │   │   ├── CWSDPMI.EXE          # DPMI host (must be alongside .EXE)
@@ -80,12 +80,76 @@ the Makefile relative to the project root.
 
 ## How to Test
 
-1. Start the server: `cd pi_server && python server.py`
+1. Start the server: `cd pi_server && .\venv\Scripts\activate && python server.py`
+   - A Chrome window will open — minimize it, don't close it
 2. Launch DOSBox-X: `cd dos_client && run.bat`
 3. At the DOS prompt: `RETRO.EXE`
 
 DOSBox-X SLIRP networking: DOS guest at 10.0.2.15, host at 10.0.2.2.
 The client connects to 10.0.2.2:8086 which routes to localhost:8086.
+
+## Architecture Overview
+
+### Frame Streaming (No XOR)
+
+Tiles are **raw palette-indexed pixels**, NOT XOR-encoded. XOR delta encoding was
+removed because any client/server state desync caused permanent visual corruption.
+
+The server still tracks `prev_indexed` for **change detection** (only send tiles that
+actually changed), but the tile data sent is raw RLE-compressed pixels. The client
+simply decompresses and blits — no prev_tiles buffer, no state to sync.
+
+### ACK-Paced Push Loop (server.py)
+
+The server has two concurrent async loops:
+- **push_loop**: Captures frames and sends them, gated by client ACKs
+- **receive_loop**: Processes client input (mouse, keyboard, navigation)
+
+Push loop has two modes:
+- **ACTIVE**: Recent frames had tile changes. Capture immediately after each ACK
+  with zero delay. Maximizes throughput during page loads.
+- **IDLE**: 3+ consecutive frames with no tile changes. Polls for dirty state
+  with 10ms intervals to avoid wasting CPU on unnecessary screenshots.
+
+### ACK Pipelining (client main.c)
+
+The client sends FRAME_ACK **immediately after receiving** the frame data, BEFORE
+flushing to VGA. This lets the server start capturing the next frame while the
+client renders the current one to VGA (overlapping capture with rendering).
+
+### TCP Throughput (client network.c)
+
+- 48KB receive buffer via `sock_setbuf()` — increases TCP window so server can
+  send a full frame without mid-transfer ACK stalls
+- `tcp.recv_win = 49152` also set in WATTCP.CFG as belt-and-suspenders
+- Progress-based receive retry: retries up to 50 times with no new data, but
+  resets counter whenever bytes actually arrive (handles 10Mbps links gracefully)
+
+### Browser Stealth (session.py)
+
+Sites like Reddit and Google detect headless Playwright. We counter with:
+- **Headed real Chrome** (`channel='chrome'`, `headless=False`) — not headless at all
+- **Realistic User-Agent** (Chrome 131 on Windows 10)
+- **navigator.webdriver removed** via init script
+- **Fake plugins/languages/chrome object** injected
+- **`--disable-blink-features=AutomationControlled`** Chromium arg
+- **`--force-device-scale-factor=1`** — prevents Windows DPI scaling from breaking clicks
+- **`--disable-renderer-backgrounding`** — prevents throttling when Chrome is minimized
+- Fallback: if real Chrome isn't installed, uses Playwright's bundled Chromium (headed)
+- On Pi without monitor: use Xvfb virtual framebuffer (`Xvfb :99 -screen 0 640x480x24 &`)
+
+### Browser Optimizations (session.py)
+
+CSS injected into every page:
+- `animation-duration: 0s` / `transition-duration: 0s` — everything appears instantly
+- `backdrop-filter: none` — kills frosted glass/blur effects
+- Video/audio/YouTube iframes hidden (can't play on DOS)
+- Scrollbar hidden (reduces dirty tiles during scroll)
+
+Playwright context options:
+- `reduced_motion='reduce'` — sites disable their own animations
+- `color_scheme='light'` — forces light mode (dithers better to 256 colors)
+- `--autoplay-policy=user-gesture-required` — no autoplaying media
 
 ## Protocol Reference
 
@@ -97,22 +161,28 @@ and mirrored in `dos_client/src/protocol.h` (C, the client version).
 - TCP port 8086
 - Key message types: CLIENT_HELLO(0x01), SERVER_HELLO(0x81), PALETTE(0x82),
   FRAME_DELTA(0x84), INTERACTION_MAP(0x85), MOUSE_EVENT(0x10), KEY_EVENT(0x11),
-  SCROLL_EVENT(0x12), NAVIGATE(0x14), STATUS(0x87)
+  SCROLL_EVENT(0x12), NAVIGATE(0x14), STATUS(0x87), ACK(0x20)
+- FRAME_FULL and FRAME_DELTA are handled identically by the client (both are raw tiles)
+- Large frames split with FLAG_CONTINUED; ACK sent after last chunk
+- header.reserved carries scroll_dy for scroll optimization
 
-## What's Done
+## What's Complete
 
-- **Pi server**: 100% complete, tested on Windows (+ animation detection, input focus cursor blink)
+- **Server**: Asyncio TCP server with ACK-paced active/idle push loop
+- **Session**: Playwright browser management with stealth + CSS optimizations
+- **Pipeline**: Bayer dither, palette LUT, tile change detection, RLE compression (no XOR)
 - **Protocol**: Fully defined and implemented on both sides
 - **DOS dev environment**: DJGPP + Watt-32 + DOSBox-X all working
-- **Phase 1 - Video/Fonts/Config**: VESA mode detection, LFB+banked, palette, BIOS fonts, config file
-- **Phase 2 - Network Rendering**: RLE decompression, XOR delta tiles, frame display
-- **Phase 3 - Mouse/Cursor/Input**: INT 33h mouse, software cursor, click/scroll/keyboard events
-- **Phase 4 - Browser Chrome**: Nav buttons, editable URL bar, status bar, correct palette colors
-- **Phase 5 - Interaction Map**: Forwarding mode, cursor shapes (hand/I-beam), hit testing
+- **Video/Fonts/Config**: VESA mode detection, LFB+banked, palette, BIOS fonts, config file
+- **Network Rendering**: RLE decompression, raw tile blit, 48KB TCP buffer, ACK pipelining
+- **Mouse/Cursor/Input**: INT 33h mouse, software cursor, click/scroll/keyboard events
+- **Browser Chrome**: Nav buttons, editable URL bar, status bar, correct palette colors
+- **Interaction Map**: Forwarding mode, cursor shapes (hand/I-beam), hit testing
 
 ## What's Next
 
-1. **Phase 6 - Polish** - Error handling, reconnect, keepalive, CONTINUED flag, double-click
+1. **Polish** - Error handling, reconnect on disconnect, keepalive, double-click
+2. **YouTube mode** - Low-res video/audio streaming to DOS (future exploration)
 
 ## Palette (IMPORTANT)
 
@@ -120,7 +190,7 @@ The server palette is a 6x6x6 RGB color cube (indices 0-215), NOT CGA colors.
 - Index = R*36 + G*6 + B, where R,G,B are 0-5 (mapping to 0,51,102,153,204,255)
 - **Black** = index 0 (0,0,0)
 - **White** = index 215 (255,255,255)
-- **Light gray** = index 172 (204,204,204) — computed as 4*36+4*6+4
+- **Light gray** = index 172 (204,204,204) -- computed as 4*36+4*6+4
 - Indices 216-239: grayscale ramp. 240-249: web accents. 250-254: reserved chrome colors.
 - Do NOT use CGA indices (7, 8, 15) for chrome UI - they map to blues/teals in this palette.
 
@@ -129,21 +199,32 @@ The server palette is a 6x6x6 RGB color cube (indices 0-215), NOT CGA colors.
 The CLIENT_HELLO sends `vc->height` (480) as `screen_height` and `chrome_height` (24) as the top bar height.
 The server computes: `viewport = 480 - 24 = 456`. Do NOT change this without careful testing.
 
-## Phase 5 Design Decision: Forwarding Mode (not local editing)
+## Forwarding Mode (not local editing)
 
-DESIGN.md Section 8.3 describes local text editing (DOS renders text fields locally for zero-latency typing).
+DESIGN.md described local text editing (DOS renders text fields locally).
 This was attempted and **abandoned** because:
-1. Server frame deltas overwrite locally-drawn text (constant fighting/flicker)
+1. Server frame updates overwrite locally-drawn text (constant fighting/flicker)
 2. Server's bg_color mapping often returns wrong palette indices (fields turn black)
 3. Complexity wasn't worth it for the marginal latency improvement
 
-Instead, **forwarding mode** is used for ALL editable elements (text inputs, textareas, passwords,
-contenteditable). Keys are sent to the server as KEY_EVENT, and the visual result comes back via
-frame deltas (~50-200ms latency). This is reliable and works everywhere.
+Instead, **forwarding mode** is used for ALL editable elements (text inputs, textareas,
+passwords, contenteditable). Keys are sent to the server as KEY_EVENT, and the visual
+result comes back via frame data (~50-200ms latency). This is reliable and works everywhere.
 
-**Playwright caret**: Must use `caret='initial'` in `page.screenshot()` — Playwright hides the text
-cursor by default. Also added `__retrosurf_input_focused` JS flag so `check_dirty()` returns true
-while an input has focus (forces periodic frame captures for cursor blink).
+**Playwright caret**: Must use `caret='initial'` in `page.screenshot()` -- Playwright hides
+the text cursor by default. Also added `__retrosurf_input_focused` JS flag so `check_dirty()`
+returns true while an input has focus (forces periodic frame captures for cursor blink).
+
+## Important Design Decisions
+
+- **No XOR delta encoding**: Removed because any state desync caused permanent corruption.
+  Raw tiles with RLE compression are simple, robust, and only ~2-3% more bandwidth.
+- **ACK before VGA flush**: Client sends ACK immediately after receiving frame, before the
+  slow VGA write. Overlaps server capture with client rendering for ~2x throughput.
+- **Active/idle streaming**: No artificial delays between frames when content is changing.
+  Only polls for dirty state after 3 consecutive empty frames.
+- **Pipeline reset on navigation**: Server resets `pipeline.prev_indexed = None` on
+  navigate/back/forward/reload so all tiles are sent for the new page.
 
 ## Important Notes
 
@@ -153,7 +234,7 @@ while an input has focus (forces periodic frame captures for cursor blink).
 - The server binds to 0.0.0.0:8086 (important for SLIRP to reach it).
 - CWSDPMI.EXE must always be in the same directory as the compiled .EXE.
 - pi_server/protocol.py is the canonical protocol definition. dos_client/src/protocol.h must match it exactly.
-- Watt-32 API: `sock_init()`, `tcp_open()`, `sock_write()`, `sock_fastread()`, `sock_dataready()`, `tcp_tick()`, `sock_established()`.
+- Watt-32 API: `sock_init()`, `tcp_open()`, `sock_write()`, `sock_fastread()`, `sock_dataready()`, `tcp_tick()`, `sock_established()`, `sock_setbuf()`.
 - Do NOT use `sock_wait_established()` -- it's unreliable under SLIRP. Use manual polling with `tcp_tick()` + `sock_established()` instead.
 - `tcp_Socket` is opaque -- no `.state` member. Use `sockstate()` or `tcp_simple_state()`.
 - Use `resolve()` for IP addresses, not `inet_addr()`.
