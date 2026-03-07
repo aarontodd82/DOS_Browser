@@ -229,6 +229,7 @@ class BrowserSession:
         # Change tracking
         self._dirty = True
         self._interaction_dirty = True
+        self._last_scroll_y = 0
 
     async def configure_viewport(self, width, height, color_depth, tile_size):
         """Set up the browser context and page at the requested viewport size."""
@@ -277,6 +278,7 @@ class BrowserSession:
         self.is_loading = True
         self._dirty = True
         self._interaction_dirty = True
+        self._last_scroll_y = 0
         self.last_activity = time.time()
 
         # Add https:// if no scheme provided
@@ -300,6 +302,7 @@ class BrowserSession:
         self.last_activity = time.time()
         self._dirty = True
         self._interaction_dirty = True
+        self._last_scroll_y = 0
         try:
             await self.page.go_back(wait_until='domcontentloaded', timeout=15000)
             self.current_url = self.page.url
@@ -311,6 +314,7 @@ class BrowserSession:
         self.last_activity = time.time()
         self._dirty = True
         self._interaction_dirty = True
+        self._last_scroll_y = 0
         try:
             await self.page.go_forward(wait_until='domcontentloaded', timeout=15000)
             self.current_url = self.page.url
@@ -323,6 +327,7 @@ class BrowserSession:
         self.is_loading = True
         self._dirty = True
         self._interaction_dirty = True
+        self._last_scroll_y = 0
         try:
             await self.page.reload(wait_until='domcontentloaded', timeout=30000)
         except Exception:
@@ -360,6 +365,11 @@ class BrowserSession:
                 window.__retrosurf_dirty = false;
                 if (domDirty) return true;
 
+                // Check scroll dirty flag (set by scroll event listener)
+                const scrollDirty = window.__retrosurf_scroll_dirty;
+                window.__retrosurf_scroll_dirty = false;
+                if (scrollDirty) return true;
+
                 // Check our rAF hook / canvas / GIF detection flag
                 if (window.__retrosurf_has_animation) return true;
 
@@ -393,11 +403,22 @@ class BrowserSession:
         """Capture a screenshot and process it through the pipeline.
 
         Returns:
-            list of (tile_index, compressed_bytes) for changed tiles,
-            or empty list if capture failed
+            tuple of (tiles, scroll_dy) where tiles is a list of
+            (tile_index, compressed_bytes) for changed tiles, and
+            scroll_dy is the vertical scroll delta in pixels.
+            Returns ([], 0) if capture failed.
         """
         self._dirty = False
         self.last_activity = time.time()
+
+        # Track scroll position for shift-based delta optimization
+        scroll_dy = 0
+        try:
+            current_sy = await self.page.evaluate('window.scrollY')
+            scroll_dy = int(current_sy - self._last_scroll_y)
+            self._last_scroll_y = current_sy
+        except Exception:
+            pass
 
         try:
             screenshot_bytes = await self.page.screenshot(
@@ -407,7 +428,7 @@ class BrowserSession:
             )
         except Exception as e:
             print(f"[Session {self.session_id}] Screenshot failed: {e}")
-            return []
+            return ([], 0)
 
         # Update URL and title
         try:
@@ -416,27 +437,33 @@ class BrowserSession:
         except Exception:
             pass
 
-        # Process through image pipeline
-        tiles = self.pipeline.process_frame(screenshot_bytes)
-        return tiles
+        # Process through image pipeline (shift-aware delta)
+        tiles = self.pipeline.process_frame(screenshot_bytes, scroll_dy=scroll_dy)
+        return (tiles, scroll_dy)
 
     async def get_interaction_map(self):
         """Detect interactive elements on the current page.
 
         Returns:
-            list of element dicts, scroll_y position
+            tuple of (elements, scroll_y, scroll_height)
         """
         self._interaction_dirty = False
         self.last_activity = time.time()
 
         try:
             elements = await detect_interactive_elements(self.page)
-            scroll_y = await self.page.evaluate('() => Math.round(window.scrollY)')
+            scroll_info = await self.page.evaluate('''() => ({
+                y: Math.round(window.scrollY),
+                h: Math.round(document.documentElement.scrollHeight)
+            })''')
+            scroll_y = scroll_info['y']
+            scroll_height = scroll_info['h']
         except Exception:
             elements = []
             scroll_y = 0
+            scroll_height = 0
 
-        return elements, scroll_y
+        return elements, scroll_y, scroll_height
 
     async def inject_mouse_click(self, x, y, button='left'):
         """Click at screen coordinates."""
@@ -552,10 +579,8 @@ class BrowserSession:
             amount: number of "lines" to scroll
         """
         self.last_activity = time.time()
-        self._dirty = True
-        self._interaction_dirty = True
 
-        pixels = amount * 40  # ~40px per "line"
+        pixels = amount * 48  # Tile-aligned: 48px = 3 × 16px tiles
         if direction == 1:
             pixels = -pixels
 
@@ -566,6 +591,11 @@ class BrowserSession:
                 await self.page.evaluate(f'window.scrollBy(0, {pixels})')
             except Exception:
                 pass
+
+        # Set dirty AFTER scroll completes to prevent push loop from
+        # capturing a pre-scroll frame during the await above
+        self._dirty = True
+        self._interaction_dirty = True
 
     async def get_status_text(self):
         """Build status bar text."""

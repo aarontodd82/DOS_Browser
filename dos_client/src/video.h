@@ -67,6 +67,10 @@ void video_flush_full(VideoConfig *vc);
 void video_fill_rect(VideoConfig *vc, uint16_t x, uint16_t y,
                      uint16_t w, uint16_t h, uint8_t color);
 
+/* Shift the content area of the backbuffer by dy pixels vertically.
+ * Positive dy = content moves up (scroll down). Fills gap with fill_color. */
+void video_shift_content(VideoConfig *vc, int16_t dy, uint8_t fill_color);
+
 /* Restore text mode and free resources. */
 void video_shutdown(VideoConfig *vc);
 

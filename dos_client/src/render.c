@@ -175,6 +175,40 @@ void render_apply_frame(RenderContext *rc, VideoConfig *vc,
     }
 }
 
+void render_shift_prev(RenderContext *rc, int16_t scroll_dy)
+{
+    int tile_shift, src_start, dst_start, count;
+
+    if (scroll_dy == 0 || scroll_dy % TILE_SIZE != 0) return;
+    if (!rc->prev_tiles) return;
+
+    tile_shift = scroll_dy / TILE_SIZE;  /* positive = shift up */
+
+    if (tile_shift > 0) {
+        /* Content moved up: shift tile rows up */
+        src_start = tile_shift * rc->cols;
+        if (src_start >= rc->total) return;
+        count = rc->total - src_start;
+        memmove(rc->prev_tiles,
+                rc->prev_tiles + (uint32_t)src_start * TILE_PIXELS,
+                (uint32_t)count * TILE_PIXELS);
+        /* Clear exposed bottom rows */
+        memset(rc->prev_tiles + (uint32_t)count * TILE_PIXELS,
+               0, (uint32_t)src_start * TILE_PIXELS);
+    } else {
+        /* Content moved down: shift tile rows down */
+        int abs_shift = -tile_shift;
+        dst_start = abs_shift * rc->cols;
+        if (dst_start >= rc->total) return;
+        count = rc->total - dst_start;
+        memmove(rc->prev_tiles + (uint32_t)dst_start * TILE_PIXELS,
+                rc->prev_tiles,
+                (uint32_t)count * TILE_PIXELS);
+        /* Clear exposed top rows */
+        memset(rc->prev_tiles, 0, (uint32_t)dst_start * TILE_PIXELS);
+    }
+}
+
 void render_reset(RenderContext *rc)
 {
     if (rc->prev_tiles) {

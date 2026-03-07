@@ -20,12 +20,15 @@ void interact_parse_map(InteractCtx *ctx, const uint8_t *payload,
     uint16_t value_len;
     int i;
 
-    if (payload_len < 4) return;
+    if (payload_len < 10) return;
 
-    /* Header: element_count(u16), scroll_y(u16) */
+    /* Header: element_count(u16), scroll_y(u32), scroll_height(u32) */
     elem_count = payload[0] | (payload[1] << 8);
-    ctx->map.scroll_y = payload[2] | (payload[3] << 8);
-    offset = 4;
+    ctx->map.scroll_y = payload[2] | (payload[3] << 8)
+                      | ((uint32_t)payload[4] << 16) | ((uint32_t)payload[5] << 24);
+    ctx->map.scroll_height = payload[6] | (payload[7] << 8)
+                           | ((uint32_t)payload[8] << 16) | ((uint32_t)payload[9] << 24);
+    offset = 10;
 
     if (elem_count > MAX_INTERACT_ELEMS)
         elem_count = MAX_INTERACT_ELEMS;

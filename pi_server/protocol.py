@@ -88,9 +88,9 @@ class SequenceCounter:
 
 # --- Header Encoding/Decoding ---
 
-def encode_header(msg_type, flags, payload_len, sequence):
+def encode_header(msg_type, flags, payload_len, sequence, reserved=0):
     """Encode an 8-byte message header."""
-    return struct.pack(HEADER_FORMAT, msg_type, flags, payload_len, sequence, 0)
+    return struct.pack(HEADER_FORMAT, msg_type, flags, payload_len, sequence, reserved)
 
 
 def decode_header(data):
@@ -108,7 +108,7 @@ def decode_header(data):
     }
 
 
-def encode_message(msg_type, payload, sequence, flags=0):
+def encode_message(msg_type, payload, sequence, flags=0, reserved=0):
     """Encode a complete message (header + payload).
 
     Args:
@@ -116,11 +116,12 @@ def encode_message(msg_type, payload, sequence, flags=0):
         payload: bytes payload (or empty bytes)
         sequence: sequence number
         flags: flag bits
+        reserved: int16 value for header reserved field (used for scroll_dy)
 
     Returns:
         bytes of the complete message
     """
-    header = encode_header(msg_type, flags, len(payload), sequence)
+    header = encode_header(msg_type, flags, len(payload), sequence, reserved)
     return header + payload
 
 
@@ -337,17 +338,18 @@ def encode_interaction_element(elem):
     return header + value_bytes
 
 
-def encode_interaction_map(elements, page_scroll_y=0):
+def encode_interaction_map(elements, page_scroll_y=0, page_scroll_height=0):
     """Encode INTERACTION_MAP payload.
 
     Args:
         elements: list of element dicts
         page_scroll_y: current page scroll position
+        page_scroll_height: total document scroll height
 
     Returns:
         bytes of the interaction map payload
     """
-    parts = [struct.pack('<HH', len(elements), page_scroll_y)]
+    parts = [struct.pack('<HII', len(elements), page_scroll_y, page_scroll_height)]
     for elem in elements:
         parts.append(encode_interaction_element(elem))
     return b''.join(parts)

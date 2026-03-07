@@ -144,14 +144,16 @@ class RetroSurfServer:
             await asyncio.sleep(0.5)
 
             # Send initial full frame
-            tiles = await session.capture_frame()
-            if tiles:
-                await self._send_tiles(writer, tiles, seq, full=True)
-                print(f"[Server] Sent initial frame ({len(tiles)} tiles)")
+            result = await session.capture_frame()
+            if result:
+                tiles, _ = result
+                if tiles:
+                    await self._send_tiles(writer, tiles, seq, full=True)
+                    print(f"[Server] Sent initial frame ({len(tiles)} tiles)")
 
             # Send initial interaction map
-            elements, scroll_y = await session.get_interaction_map()
-            map_payload = encode_interaction_map(elements, scroll_y)
+            elements, scroll_y, scroll_height = await session.get_interaction_map()
+            map_payload = encode_interaction_map(elements, scroll_y, scroll_height)
             await self._send_message(writer, MSG_INTERACTION_MAP, map_payload, seq)
             print(f"[Server] Sent interaction map ({len(elements)} elements)")
 
@@ -206,17 +208,20 @@ class RetroSurfServer:
                 continue
 
             if is_dirty:
-                # Capture and send frame delta
-                tiles = await session.capture_frame()
-                if tiles:
-                    await self._send_tiles(writer, tiles, seq)
+                # Capture and send frame delta (with scroll optimization)
+                result = await session.capture_frame()
+                if result:
+                    tiles, scroll_dy = result
+                    if tiles:
+                        await self._send_tiles(writer, tiles, seq,
+                                               scroll_dy=scroll_dy)
 
             # Periodically update interaction map
             now = time.time()
             if now - last_interaction_time > interaction_interval:
                 try:
-                    elements, scroll_y = await session.get_interaction_map()
-                    map_payload = encode_interaction_map(elements, scroll_y)
+                    elements, scroll_y, scroll_height = await session.get_interaction_map()
+                    map_payload = encode_interaction_map(elements, scroll_y, scroll_height)
                     await self._send_message(writer, MSG_INTERACTION_MAP,
                                              map_payload, seq)
                 except Exception:
@@ -335,11 +340,13 @@ class RetroSurfServer:
         writer.write(msg)
         await writer.drain()
 
-    async def _send_tiles(self, writer, tiles, seq, full=False):
+    async def _send_tiles(self, writer, tiles, seq, full=False, scroll_dy=0):
         """Send tile data, splitting into multiple messages if needed.
 
         Uses FRAME_FULL for initial/full frames, FRAME_DELTA for updates.
         Splits payload at ~60KB boundaries to stay within uint16 payload_len.
+        scroll_dy is passed in header.reserved of the first chunk for
+        client-side prev_tiles shift optimization.
         """
         msg_type = MSG_FRAME_FULL if full else MSG_FRAME_DELTA
         max_tiles_per_msg = 200  # ~50KB assuming ~256 bytes avg per tile
@@ -352,7 +359,11 @@ class RetroSurfServer:
             if i + max_tiles_per_msg < len(tiles):
                 flags |= FLAG_CONTINUED
 
-            msg = encode_message(msg_type, payload, seq.next(), flags)
+            # First chunk carries scroll_dy in reserved field
+            reserved = scroll_dy if i == 0 else 0
+            # Clamp to int16 range
+            reserved = max(-32768, min(32767, reserved))
+            msg = encode_message(msg_type, payload, seq.next(), flags, reserved)
             writer.write(msg)
 
         await writer.drain()

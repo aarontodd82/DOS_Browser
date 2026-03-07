@@ -37,7 +37,8 @@ typedef struct {
 typedef struct {
     InteractElem elems[MAX_INTERACT_ELEMS];
     uint16_t     elem_count;
-    uint16_t     scroll_y;       /* Page scroll position */
+    uint32_t     scroll_y;       /* Page scroll position (pixels) */
+    uint32_t     scroll_height;  /* Total document height (pixels) */
 } InteractMap;
 
 /* Interaction mode */

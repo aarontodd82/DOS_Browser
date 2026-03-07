@@ -33,6 +33,11 @@ int render_init(RenderContext *rc, VideoConfig *vc);
 void render_apply_frame(RenderContext *rc, VideoConfig *vc,
                         const uint8_t *payload, uint16_t payload_len);
 
+/* Shift prev_tiles by scroll_dy pixels (must be tile-aligned).
+ * Called before applying FRAME_DELTA when header.reserved != 0.
+ * Positive scroll_dy = scrolled down = content moved up = shift up. */
+void render_shift_prev(RenderContext *rc, int16_t scroll_dy);
+
 /* Reset all previous tile data (e.g., on navigation).
  * Next frame should be a FRAME_FULL. */
 void render_reset(RenderContext *rc);

@@ -192,7 +192,7 @@ class ImagePipeline:
         # Stats
         self.frame_count = 0
 
-    def process_frame(self, image_input):
+    def process_frame(self, image_input, scroll_dy=0):
         """Process a screenshot into compressed delta tiles.
 
         Args:
@@ -200,6 +200,10 @@ class ImagePipeline:
               - bytes: JPEG/PNG image data
               - PIL.Image: already-decoded image
               - numpy array: (H, W, 3) uint8 RGB
+            scroll_dy: vertical scroll delta in pixels since last frame.
+                Positive = scrolled down (content moved up).
+                If tile-aligned, prev_indexed is shifted before XOR
+                to minimize changed tiles.
 
         Returns:
             list of (tile_index, compressed_bytes) tuples for changed tiles.
@@ -218,6 +222,10 @@ class ImagePipeline:
 
         # Map to palette indices via LUT
         indexed = apply_lut(img_dithered, self.lut)
+
+        # Shift prev_indexed to match scroll offset (reduces changed tiles)
+        if self.prev_indexed is not None and scroll_dy != 0 and scroll_dy % self.tile_size == 0:
+            self.prev_indexed = self._shift_prev(self.prev_indexed, scroll_dy)
 
         # Find changed tiles and compress them
         if self.prev_indexed is None:
@@ -423,3 +431,22 @@ class ImagePipeline:
                     changed.append(row * self.tile_cols + col)
 
         return changed
+
+    def _shift_prev(self, prev, scroll_dy):
+        """Shift prev_indexed by scroll_dy pixels vertically.
+
+        Positive scroll_dy = scrolled down = content moved up = shift array up.
+        Cleared rows (zeros) at the exposed edge will XOR as "changed",
+        which is correct since those tiles have genuinely new content.
+        """
+        shifted = np.zeros_like(prev)
+        if scroll_dy > 0:
+            # Content moved up: copy old rows [dy:] to new rows [0:H-dy]
+            if scroll_dy < self.height:
+                shifted[:self.height - scroll_dy, :] = prev[scroll_dy:, :]
+        elif scroll_dy < 0:
+            # Content moved down: copy old rows [0:H+dy] to new rows [-dy:]
+            dy = -scroll_dy
+            if dy < self.height:
+                shifted[dy:, :] = prev[:self.height - dy, :]
+        return shifted

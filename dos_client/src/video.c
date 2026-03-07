@@ -515,6 +515,34 @@ void video_fill_rect(VideoConfig *vc, uint16_t x, uint16_t y,
     }
 }
 
+void video_shift_content(VideoConfig *vc, int16_t dy, uint8_t fill_color)
+{
+    uint16_t content_start = vc->chrome_height;
+    uint16_t content_end = vc->height - vc->status_height;
+    uint16_t content_h = content_end - content_start;
+    uint8_t *base = vc->backbuffer + (uint32_t)content_start * vc->width;
+    uint16_t abs_dy = (dy < 0) ? -dy : dy;
+
+    if (abs_dy == 0 || abs_dy >= content_h) return;
+
+    if (dy > 0) {
+        /* Content moves up (scroll down) */
+        memmove(base,
+                base + (uint32_t)abs_dy * vc->width,
+                (uint32_t)(content_h - abs_dy) * vc->width);
+        /* Fill bottom gap */
+        memset(base + (uint32_t)(content_h - abs_dy) * vc->width,
+               fill_color, (uint32_t)abs_dy * vc->width);
+    } else {
+        /* Content moves down (scroll up) */
+        memmove(base + (uint32_t)abs_dy * vc->width,
+                base,
+                (uint32_t)(content_h - abs_dy) * vc->width);
+        /* Fill top gap */
+        memset(base, fill_color, (uint32_t)abs_dy * vc->width);
+    }
+}
+
 void video_shutdown(VideoConfig *vc)
 {
     __dpmi_regs r;

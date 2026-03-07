@@ -258,6 +258,13 @@ static int run_browser(Config *cfg, VideoConfig *vc)
             switch (header.msg_type) {
             case MSG_FRAME_FULL:
             case MSG_FRAME_DELTA:
+                /* Shift prev_tiles AND backbuffer to match server's scroll-aware delta */
+                if (header.reserved != 0 &&
+                    header.msg_type == MSG_FRAME_DELTA) {
+                    render_shift_prev(&render, header.reserved);
+                    video_shift_content(vc, header.reserved, 0);
+                    vc->full_flush = 1;
+                }
                 render_apply_frame(&render, vc, payload_buf, payload_len);
                 break;
 
@@ -354,11 +361,11 @@ static int run_browser(Config *cfg, VideoConfig *vc)
                     int slen;
                     switch (key.scancode) {
                     case 0x49: /* Page Up - scroll UP (direction=1) */
-                        slen = proto_encode_scroll_event(sbuf, 1, 3);
+                        slen = proto_encode_scroll_event(sbuf, 1, 9);
                         net_send_message(&ctx, MSG_SCROLL_EVENT, sbuf, slen);
                         break;
                     case 0x51: /* Page Down - scroll DOWN (direction=0) */
-                        slen = proto_encode_scroll_event(sbuf, 0, 3);
+                        slen = proto_encode_scroll_event(sbuf, 0, 9);
                         net_send_message(&ctx, MSG_SCROLL_EVENT, sbuf, slen);
                         break;
                     case 0x48: /* Up arrow - scroll UP (direction=1) */
