@@ -13,6 +13,7 @@
 #include <sys/farptr.h>
 #include <sys/nearptr.h>
 #include <pc.h>
+#include <tcp.h>
 #include "video.h"
 #include "config.h"
 
@@ -65,6 +66,18 @@ typedef struct {
 static __dpmi_meminfo lfb_mapping;
 static int lfb_mapped = 0;
 static int nearptr_enabled = 0;
+
+/* Bank cache - avoid redundant INT 10h BIOS calls for bank switching */
+static int current_bank = -1;
+static void vbe_set_bank(int bank);  /* forward declaration */
+
+static void set_bank_cached(int bank)
+{
+    if (bank != current_bank) {
+        vbe_set_bank(bank);
+        current_bank = bank;
+    }
+}
 
 /* ---- VBE helper functions ---- */
 
@@ -193,12 +206,9 @@ static void banked_copy_row(VideoConfig *vc, int y, int x, int width)
         uint32_t bank_off = offset % gran;
         uint32_t avail = gran - bank_off;
         int chunk = remaining < (int)avail ? remaining : (int)avail;
-        int i;
 
-        vbe_set_bank(bank);
-        for (i = 0; i < chunk; i++) {
-            _farpokeb(_dos_ds, 0xA0000 + bank_off + i, src[i]);
-        }
+        set_bank_cached(bank);
+        dosmemput(src, chunk, 0xA0000 + bank_off);
 
         src += chunk;
         offset += chunk;
@@ -315,6 +325,7 @@ int video_init(VideoConfig *vc, uint8_t preferred_mode)
         goto vga_fallback;
     }
 
+    current_bank = -1;
     goto setup_common;
 
 vga_fallback:
@@ -442,13 +453,13 @@ void video_flush_full(VideoConfig *vc)
             outportb(0x3C5, 1 << plane);  /* Select plane */
             for (y = 0; y < vc->height; y++) {
                 for (x = 0; x < vc->width; x += 8) {
-                    uint8_t byte = 0;
+                    uint8_t pbyte = 0;
                     for (bit = 0; bit < 8; bit++) {
                         uint8_t pixel = vc->backbuffer[y * vc->width + x + bit];
                         if (pixel & (1 << plane))
-                            byte |= (0x80 >> bit);
+                            pbyte |= (0x80 >> bit);
                     }
-                    _farpokeb(_dos_ds, 0xA0000 + y * (vc->width / 8) + x / 8, byte);
+                    _farpokeb(_dos_ds, 0xA0000 + y * (vc->width / 8) + x / 8, pbyte);
                 }
             }
         }
@@ -472,7 +483,6 @@ void video_flush_full(VideoConfig *vc)
     } else {
         /* Banked mode: copy in chunks with bank switching */
         uint32_t gran = (uint32_t)vc->bank_granularity * 1024;
-        int bank = 0;
         int y;
 
         /* Row-by-row copy with bank tracking */
@@ -488,20 +498,16 @@ void video_flush_full(VideoConfig *vc)
                 uint32_t bank_off = cur_offset % gran;
                 uint32_t avail = gran - bank_off;
                 int chunk = remaining < (int)avail ? remaining : (int)avail;
-                int i;
 
-                if (new_bank != bank) {
-                    vbe_set_bank(new_bank);
-                    bank = new_bank;
-                }
-
-                for (i = 0; i < chunk; i++) {
-                    _farpokeb(_dos_ds, 0xA0000 + bank_off + i, src[col + i]);
-                }
+                set_bank_cached(new_bank);
+                dosmemput(src + col, chunk, 0xA0000 + bank_off);
 
                 col += chunk;
                 remaining -= chunk;
             }
+
+            /* Keep network alive during long full-screen flushes */
+            if (y % 48 == 0) tcp_tick(NULL);
         }
     }
 }
@@ -546,6 +552,8 @@ void video_shift_content(VideoConfig *vc, int16_t dy, uint8_t fill_color)
 void video_shutdown(VideoConfig *vc)
 {
     __dpmi_regs r;
+
+    current_bank = -1;
 
     /* Restore text mode 03h */
     memset(&r, 0, sizeof(r));

@@ -72,20 +72,34 @@ int net_connect(net_context_t *ctx, const char *server_ip, uint16_t port)
     start = clock();
     deadline = start + (clock_t)wait_secs * CLOCKS_PER_SEC;
 
-    while (clock() < deadline) {
-        if (!tcp_tick(&tcp_sock)) {
-            snprintf(ctx->error_msg, sizeof(ctx->error_msg),
-                     "Connection refused by server");
-            ctx->state = NET_ERROR;
-            return -1;
-        }
+    {
+        int tick_count = 0;
+        clock_t last_print = start;
 
-        if (sock_established(&tcp_sock)) {
-            ctx->state = NET_CONNECTED;
-            ctx->recv_pos = 0;
-            ctx->recv_need = HEADER_SIZE;
-            printf("Connected!\n");
-            return 0;
+        while (clock() < deadline) {
+            if (!tcp_tick(&tcp_sock)) {
+                snprintf(ctx->error_msg, sizeof(ctx->error_msg),
+                         "Connection refused (tcp_tick failed after %d ticks)",
+                         tick_count);
+                ctx->state = NET_ERROR;
+                return -1;
+            }
+
+            tick_count++;
+
+            if (sock_established(&tcp_sock)) {
+                ctx->state = NET_CONNECTED;
+                ctx->recv_pos = 0;
+                ctx->recv_need = HEADER_SIZE;
+                printf("Connected after %d ticks!\n", tick_count);
+                return 0;
+            }
+
+            /* Print progress every second */
+            if (clock() - last_print >= CLOCKS_PER_SEC) {
+                printf("  ...waiting (tick %d)...\n", tick_count);
+                last_print = clock();
+            }
         }
     }
 

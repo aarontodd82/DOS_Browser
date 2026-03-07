@@ -161,9 +161,9 @@ static void send_nav_action(net_context_t *ctx, uint8_t action)
 }
 
 /* Full browser main loop */
-static int run_browser(Config *cfg, VideoConfig *vc)
+static int run_browser(Config *cfg, VideoConfig *vc, net_context_t *passed_ctx)
 {
-    net_context_t ctx;
+    net_context_t ctx = *passed_ctx;
     RenderContext render;
     SoftCursor cursor;
     ChromeState chrome;
@@ -181,22 +181,10 @@ static int run_browser(Config *cfg, VideoConfig *vc)
     interact_init(&interact);
     memset(&mouse, 0, sizeof(mouse));
 
-    chrome_set_status(&chrome, "Connecting...");
+    chrome_set_status(&chrome, "Connected");
 
     rc = render_init(&render, vc);
     if (rc != 0) return 1;
-
-    rc = net_init();
-    if (rc != 0) { render_shutdown(&render); return 1; }
-
-    printf("Connecting to %s:%u...\n", cfg->server_ip, cfg->server_port);
-    rc = net_connect(&ctx, cfg->server_ip, cfg->server_port);
-    if (rc != 0) {
-        printf("Connection failed: %s\n", ctx.error_msg);
-        net_shutdown();
-        render_shutdown(&render);
-        return 1;
-    }
 
     /* Initialize mouse (after video is set) */
     input_init_mouse(vc->width, vc->height);
@@ -535,8 +523,8 @@ int main(int argc, char *argv[])
     printf("========================================\n\n");
 
     /* Load configuration */
-    if (config_load(&cfg, "RETROSURF.CFG") == 0)
-        printf("Config loaded from RETROSURF.CFG\n");
+    if (config_load(&cfg, "RETRO.CFG") == 0)
+        printf("Config loaded from RETRO.CFG\n");
     else
         printf("Using default config\n");
     printf("  Server: %s:%u\n", cfg.server_ip, cfg.server_port);
@@ -579,17 +567,39 @@ int main(int argc, char *argv[])
         }
     }
 
-    /* Re-init video */
-    rc = video_init(&vc, cfg.video_mode);
-    if (rc != 0) {
-        printf("ERROR: Video re-init failed\n");
-        getch();
-        return 1;
-    }
-    set_test_palette();
+    /* Connect in text mode so user can see errors */
+    {
+        net_context_t ctx;
+        rc = net_init();
+        if (rc != 0) {
+            printf("Network init failed. Press any key.\n");
+            getch();
+            return 1;
+        }
+        rc = net_connect(&ctx, cfg.server_ip, cfg.server_port);
+        if (rc != 0) {
+            printf("Connection failed: %s\n", ctx.error_msg);
+            printf("Press any key to exit.\n");
+            net_shutdown();
+            getch();
+            return 1;
+        }
+        printf("Connected! Starting browser...\n");
 
-    /* Run browser */
-    run_browser(&cfg, &vc);
+        /* Re-init video */
+        rc = video_init(&vc, cfg.video_mode);
+        if (rc != 0) {
+            printf("ERROR: Video re-init failed\n");
+            net_close(&ctx);
+            net_shutdown();
+            getch();
+            return 1;
+        }
+        set_test_palette();
+
+        /* Run browser (pass connected context) */
+        run_browser(&cfg, &vc, &ctx);
+    }
 
     /* Cleanup */
     video_shutdown(&vc);

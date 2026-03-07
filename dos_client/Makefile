@@ -25,7 +25,7 @@ CFLAGS += -I$(WATT32_INC)
 CFLAGS += -DRETROSURF_VERSION=\"0.1.0\"
 
 # Linker flags - Watt-32 library
-LDFLAGS = -L$(WATT32_LIB) -lwatt
+LDFLAGS = -L$(WATT32_LIB) -lwatt -lemu
 
 # Source files
 SRCS = $(wildcard src/*.c)

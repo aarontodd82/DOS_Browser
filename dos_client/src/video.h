@@ -10,7 +10,7 @@
 
 #include <stdint.h>
 
-#define MAX_DIRTY_RECTS 64
+#define MAX_DIRTY_RECTS 256
 #define CHROME_HEIGHT_640 24
 #define CHROME_HEIGHT_800 28
 
