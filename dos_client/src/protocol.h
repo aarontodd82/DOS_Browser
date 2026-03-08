@@ -32,6 +32,7 @@
 #define MSG_TEXT_INPUT    0x13
 #define MSG_NAVIGATE      0x14
 #define MSG_NAV_ACTION    0x15
+#define MSG_NATIVE_CLICK  0x16
 #define MSG_ACK           0xF0
 #define MSG_KEEPALIVE     0xF1
 
@@ -44,13 +45,17 @@
 #define MSG_CURSOR_SHAPE    0x86
 #define MSG_STATUS          0x87
 #define MSG_INPUT_STATE     0x88
+#define MSG_NATIVE_CONTENT  0x89
+#define MSG_NATIVE_IMAGE    0x8A
+#define MSG_MODE_SWITCH     0x8B
 #define MSG_KEEPALIVE_ACK   0xF1
 
 /* --- Nav Actions --- */
-#define NAV_BACK    0
-#define NAV_FORWARD 1
-#define NAV_RELOAD  2
-#define NAV_STOP    3
+#define NAV_BACK         0
+#define NAV_FORWARD      1
+#define NAV_RELOAD       2
+#define NAV_STOP         3
+#define NAV_TOGGLE_MODE  4
 
 /* --- Element Types --- */
 #define ELEM_LINK              0x00
@@ -201,6 +206,10 @@ int proto_encode_navigate(uint8_t *buf, const char *url);
 /* Encode NAV_ACTION payload into buf.
  * Returns payload size (1 byte). */
 int proto_encode_nav_action(uint8_t *buf, uint8_t action);
+
+/* Encode NATIVE_CLICK payload into buf.
+ * Returns payload size (2 bytes). */
+int proto_encode_native_click(uint8_t *buf, uint16_t link_id);
 
 /* --- Decoding Functions --- */
 

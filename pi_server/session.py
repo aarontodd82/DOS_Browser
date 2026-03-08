@@ -10,6 +10,9 @@ import time
 
 from image_pipeline import ImagePipeline
 from interaction_detector import detect_interactive_elements
+from complexity_detector import detect_complexity
+from content_extractor import extract_content
+from native_encoder import build_native_payload, process_native_image
 
 
 # CSS injected into every page to optimize for low-bandwidth tile streaming.
@@ -256,6 +259,10 @@ class BrowserSession:
         self._interaction_dirty = True
         self._last_scroll_y = 0
         self._nav_burst_until = 0
+
+        # Native rendering mode
+        self.render_mode = 'screenshot'  # 'screenshot' or 'native'
+        self.native_link_table = []  # [(link_id, href_url), ...]
 
     async def configure_viewport(self, width, height, color_depth, tile_size):
         """Set up the browser context and page at the requested viewport size."""
@@ -776,6 +783,83 @@ class BrowserSession:
         if self.page_title:
             parts.append(self.page_title[:60])
         return ' | '.join(parts) if parts else self.current_url[:80]
+
+    async def check_complexity(self):
+        """Check page complexity and decide rendering mode.
+
+        Returns:
+            dict with score, recommend_native, reasons
+        """
+        result = await detect_complexity(self.page)
+        print(f"[Session {self.session_id}] Complexity: score={result['score']}, "
+              f"native={result['recommend_native']}, "
+              f"reasons={result['reasons']}")
+        return result
+
+    async def extract_native_content(self):
+        """Extract content structure and build command stream payload.
+
+        Returns content immediately without processing images.
+        Call get_pending_native_images() afterward to lazily load images.
+
+        Returns:
+            content_payload bytes for MSG_NATIVE_CONTENT
+        """
+        content = await extract_content(self.page, self.viewport_width)
+
+        # Build command stream payload
+        payload, link_table = build_native_payload(
+            content, self.viewport_width
+        )
+        self.native_link_table = link_table
+
+        # Store image nodes for lazy loading
+        self._pending_native_images = [
+            node for node in content.get('nodes', [])
+            if node.get('type') == 'image'
+        ]
+
+        print(f"[Session {self.session_id}] Native content: "
+              f"{len(payload)} bytes, {len(link_table)} links, "
+              f"{len(self._pending_native_images)} images pending")
+
+        return payload
+
+    async def process_next_native_image(self):
+        """Process and return the next pending native image.
+
+        Returns:
+            (image_id, payload_bytes) or None if no more images.
+        """
+        while self._pending_native_images:
+            node = self._pending_native_images.pop(0)
+            try:
+                result = await process_native_image(
+                    self.page,
+                    node['src'],
+                    node['image_id'],
+                    max_width=min(300, self.viewport_width - 16),
+                    max_height=200,
+                )
+                if result:
+                    img_id, w, h, rle_data = result
+                    from protocol import encode_native_image
+                    img_payload = encode_native_image(
+                        img_id, w, h, rle_data)
+                    if img_payload is not None:
+                        return (img_id, img_payload)
+                    else:
+                        print(f"[Session {self.session_id}] "
+                              f"Skipping image {node['image_id']} "
+                              f"(too large)")
+            except Exception as e:
+                print(f"[Session {self.session_id}] "
+                      f"Image {node.get('image_id')} failed: {e}")
+        return None
+
+    def has_pending_native_images(self):
+        """Check if there are still images to process."""
+        return bool(getattr(self, '_pending_native_images', None))
 
     async def close(self):
         """Clean up browser context."""

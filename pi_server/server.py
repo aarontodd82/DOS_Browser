@@ -25,15 +25,17 @@ from protocol import (
     MSG_TEXT_INPUT, MSG_NAVIGATE, MSG_NAV_ACTION, MSG_ACK, MSG_KEEPALIVE,
     MSG_SERVER_HELLO, MSG_PALETTE, MSG_FRAME_FULL, MSG_FRAME_DELTA,
     MSG_INTERACTION_MAP, MSG_STATUS, MSG_KEEPALIVE_ACK,
-    NAV_BACK, NAV_FORWARD, NAV_RELOAD, NAV_STOP,
+    MSG_NATIVE_CONTENT, MSG_NATIVE_IMAGE, MSG_MODE_SWITCH, MSG_NATIVE_CLICK,
+    NAV_BACK, NAV_FORWARD, NAV_RELOAD, NAV_STOP, NAV_TOGGLE_MODE,
     MOUSE_MOVE, MOUSE_CLICK, MOUSE_RELEASE, MOUSE_DBLCLICK,
     FLAG_CONTINUED,
     decode_header, decode_client_hello, decode_mouse_event,
     decode_key_event, decode_scroll_event, decode_text_input,
-    decode_navigate, decode_nav_action,
+    decode_navigate, decode_nav_action, decode_native_click,
     encode_message, encode_server_hello, encode_palette,
     encode_frame_delta, encode_interaction_map, encode_status,
-    SequenceCounter,
+    encode_mode_switch,
+    SequenceCounter, split_large_payload,
 )
 
 
@@ -160,25 +162,30 @@ class RetroSurfServer:
             # Small delay for page to settle
             await asyncio.sleep(0.5)
 
-            # Send initial full frame (progressive)
-            prep = await session.capture_and_prepare()
-            if prep:
-                indexed, changed, scroll_dy = prep
-                if changed:
-                    count = await self._send_progressive(
-                        writer, session, indexed, changed, seq,
-                        scroll_dy=scroll_dy, msg_type=MSG_FRAME_FULL,
-                    )
-                    session.pipeline.commit_frame(indexed)
-                    print(f"[Server] Sent initial frame ({count} tiles, progressive)")
-                else:
-                    session.pipeline.commit_frame(indexed)
+            # Check if page is simple enough for native rendering
+            is_native = await self._check_and_send_native(
+                writer, session, seq)
 
-            # Send initial interaction map
-            elements, scroll_y, scroll_height = await session.get_interaction_map()
-            map_payload = encode_interaction_map(elements, scroll_y, scroll_height)
-            await self._send_message(writer, MSG_INTERACTION_MAP, map_payload, seq)
-            print(f"[Server] Sent interaction map ({len(elements)} elements)")
+            if not is_native:
+                # Send initial full frame (progressive)
+                prep = await session.capture_and_prepare()
+                if prep:
+                    indexed, changed, scroll_dy = prep
+                    if changed:
+                        count = await self._send_progressive(
+                            writer, session, indexed, changed, seq,
+                            scroll_dy=scroll_dy, msg_type=MSG_FRAME_FULL,
+                        )
+                        session.pipeline.commit_frame(indexed)
+                        print(f"[Server] Sent initial frame ({count} tiles, progressive)")
+                    else:
+                        session.pipeline.commit_frame(indexed)
+
+                # Send initial interaction map
+                elements, scroll_y, scroll_height = await session.get_interaction_map()
+                map_payload = encode_interaction_map(elements, scroll_y, scroll_height)
+                await self._send_message(writer, MSG_INTERACTION_MAP, map_payload, seq)
+                print(f"[Server] Sent interaction map ({len(elements)} elements)")
 
             # Send initial status
             status_text = await session.get_status_text()
@@ -292,6 +299,24 @@ class RetroSurfServer:
                         last_status_time = now
 
                     await asyncio.sleep(0.01)  # 10ms poll
+
+            # NATIVE MODE: skip screenshot capture entirely.
+            # Content is static until next navigation.
+            if session.render_mode == 'native':
+                # Still send periodic status updates
+                now = time.time()
+                if now - last_status_time > status_interval:
+                    try:
+                        status_text = await session.get_status_text()
+                        status_text = '[N] ' + status_text
+                        await self._send_message(writer, MSG_STATUS,
+                                                 encode_status(status_text), seq)
+                    except Exception:
+                        pass
+                    last_status_time = now
+                frame_ack_event.set()
+                await asyncio.sleep(0.05)  # 50ms poll in native mode
+                continue
 
             # ACTIVE MODE: capture immediately, no delay
 
@@ -409,6 +434,11 @@ class RetroSurfServer:
                 await self._send_message(writer, MSG_STATUS,
                                          encode_status(status_text), seq)
 
+                # Check complexity for new page
+                await asyncio.sleep(0.3)  # let page settle
+                await self._check_and_send_native(
+                    writer, session, seq)
+
             elif msg_type == MSG_NAV_ACTION:
                 action = decode_nav_action(payload)
                 if action == NAV_BACK:
@@ -423,6 +453,48 @@ class RetroSurfServer:
                 elif action == NAV_STOP:
                     print("[Server] Nav: Stop")
                     await session.stop_loading()
+                elif action == NAV_TOGGLE_MODE:
+                    print("[Server] Nav: Toggle mode")
+                    if session.render_mode == 'native':
+                        # Force screenshot mode
+                        session.render_mode = 'screenshot'
+                        if session.pipeline:
+                            session.pipeline.prev_indexed = None
+                        await self._send_message(
+                            writer, MSG_MODE_SWITCH,
+                            encode_mode_switch(0), seq)
+                        print("[Server] Forced screenshot mode")
+                    else:
+                        # Force native mode (re-extract)
+                        await self._check_and_send_native(
+                            writer, session, seq)
+
+                # Re-check complexity after navigation actions
+                if action in (NAV_BACK, NAV_FORWARD, NAV_RELOAD):
+                    await asyncio.sleep(0.5)
+                    await self._check_and_send_native(
+                        writer, session, seq)
+
+            elif msg_type == MSG_NATIVE_CLICK:
+                click = decode_native_click(payload)
+                link_id = click['link_id']
+                # Look up URL from link table
+                href = None
+                for lid, url in session.native_link_table:
+                    if lid == link_id:
+                        href = url
+                        break
+                if href:
+                    print(f"[Server] Native click: link {link_id} -> {href}")
+                    await session.navigate(href)
+                    status_text = await session.get_status_text()
+                    await self._send_message(writer, MSG_STATUS,
+                                             encode_status(status_text), seq)
+                    await asyncio.sleep(0.3)
+                    await self._check_and_send_native(
+                        writer, session, seq)
+                else:
+                    print(f"[Server] Native click: link {link_id} not found")
 
             elif msg_type == MSG_KEEPALIVE:
                 await self._send_message(writer, MSG_KEEPALIVE_ACK, b'', seq)
@@ -533,6 +605,78 @@ class RetroSurfServer:
               f"({total // batch_size + 1} batches)")
 
         return total
+
+    async def _check_and_send_native(self, writer, session, seq):
+        """Check page complexity and send native content if appropriate.
+
+        Returns True if native mode was activated, False otherwise.
+        """
+        try:
+            result = await session.check_complexity()
+        except Exception as e:
+            print(f"[Server] Complexity check failed: {e}")
+            return False
+
+        if not result['recommend_native']:
+            if session.render_mode == 'native':
+                # Switch back to screenshot mode
+                session.render_mode = 'screenshot'
+                if session.pipeline:
+                    session.pipeline.prev_indexed = None
+                await self._send_message(
+                    writer, MSG_MODE_SWITCH,
+                    encode_mode_switch(0), seq)
+                print("[Server] Switched to screenshot mode")
+            return False
+
+        # Switch to native mode
+        session.render_mode = 'native'
+        await self._send_message(
+            writer, MSG_MODE_SWITCH,
+            encode_mode_switch(1), seq)
+        print("[Server] Switched to native mode")
+
+        try:
+            # Extract and send content immediately (no image processing)
+            content_payload = await session.extract_native_content()
+
+            # Send content first — client renders text/links instantly
+            messages = split_large_payload(
+                MSG_NATIVE_CONTENT, content_payload, seq)
+            for msg in messages:
+                writer.write(msg)
+            await writer.drain()
+            print(f"[Server] Sent native content "
+                  f"({len(content_payload)} bytes, "
+                  f"{len(messages)} chunks)")
+
+            # Images stream in lazily — each one triggers a client redraw
+            while session.has_pending_native_images():
+                # Check we're still in native mode (user may have navigated)
+                if session.render_mode != 'native':
+                    break
+                result = await session.process_next_native_image()
+                if result:
+                    img_id, img_payload = result
+                    await self._send_message(
+                        writer, MSG_NATIVE_IMAGE, img_payload, seq)
+                    print(f"[Server] Sent native image {img_id} "
+                          f"({len(img_payload)} bytes)")
+
+        except Exception as e:
+            print(f"[Server] Native content extraction failed: {e}")
+            import traceback
+            traceback.print_exc()
+            # Fall back to screenshot mode
+            session.render_mode = 'screenshot'
+            if session.pipeline:
+                session.pipeline.prev_indexed = None
+            await self._send_message(
+                writer, MSG_MODE_SWITCH,
+                encode_mode_switch(0), seq)
+            return False
+
+        return True
 
     async def _send_tiles(self, writer, tiles, seq, full=False, scroll_dy=0):
         """Send tile data, splitting into multiple messages if needed.

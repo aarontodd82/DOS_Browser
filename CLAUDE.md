@@ -180,6 +180,7 @@ and mirrored in `dos_client/src/protocol.h` (C, the client version).
 - **Mouse/Cursor/Input**: INT 33h mouse, software cursor, click/scroll/keyboard events
 - **Browser Chrome**: Nav buttons, editable URL bar, status bar, correct palette colors
 - **Interaction Map**: Forwarding mode, cursor shapes (hand/I-beam), hit testing
+- **Native Rendering**: Complexity detection, content extraction, binary command stream, DOS-side text/heading/link/image/HR rendering, local scrolling, link click navigation, auto mode switching
 
 ## What's Next
 
@@ -300,3 +301,58 @@ returns true while an input has focus (forces periodic frame captures for cursor
 - The Makefile uses `$(dir $(abspath $(lastword $(MAKEFILE_LIST))))` to auto-detect paths.
 - gnumake.exe is at `tools/watt32/util/win32/gnumake.exe` (bundled with Watt-32, not a system install).
 - Git repo initialized. Commit after each working milestone.
+
+## Native Rendering Mode
+
+### What It Is
+For simple pages (retro/old-web sites), the server extracts the page's content structure and sends a compact binary command stream instead of screenshot tiles. The DOS client renders text, headings, links, images, and rules natively, enabling instant local scrolling (no server round-trip) and ~10x less bandwidth.
+
+### When It Activates
+- **Automatic**: After each navigation, `complexity_detector.py` scores the page. Score <= 40 = native mode.
+- **Domain whitelist** (always native): wiby.me, neocities.org, geocities.ws, theoldnet.com, 68k.news
+- **Domain blacklist** (always screenshot): google.com, youtube.com, reddit.com, twitter.com, facebook.com, etc.
+- **SPA detection**: React/Vue/Angular roots instantly disqualify (score +100).
+
+### Key Files
+- `pi_server/complexity_detector.py` — Page scoring via JS evaluation
+- `pi_server/content_extractor.py` — DOM walking, content extraction
+- `pi_server/native_encoder.py` — Content tree → binary command stream + image dithering
+- `dos_client/src/native.h/c` — DOS-side content parser, text renderer, word-wrap, scrolling, link hit testing
+
+### Protocol Messages
+- `MSG_MODE_SWITCH (0x8B)`: Server→Client, payload: mode(u8) 0=screenshot 1=native
+- `MSG_NATIVE_CONTENT (0x89)`: Server→Client, 7-byte header + command stream (uses FLAG_CONTINUED)
+- `MSG_NATIVE_IMAGE (0x8A)`: Server→Client, pre-dithered image data
+- `MSG_NATIVE_CLICK (0x16)`: Client→Server, link_id(u16)
+
+### Command Stream Tags (MVP)
+| Tag | Name | Data |
+|-----|------|------|
+| 0x01 | CMD_TEXT | flags(u8) color(u8) font(u8) len(u16) text |
+| 0x02 | CMD_NEWLINE | count(u8) |
+| 0x03 | CMD_HEADING | level(u8) color(u8) len(u16) text |
+| 0x04 | CMD_LINK_START | link_id(u16) color(u8) hover_color(u8) |
+| 0x05 | CMD_LINK_END | (none) |
+| 0x06 | CMD_HR | color(u8) thickness(u8) |
+| 0x07 | CMD_IMAGE | image_id(u16) width(u16) height(u16) align(u8) |
+| 0x08 | CMD_SET_BG | color(u8) |
+| 0x09 | CMD_PARAGRAPH | (none) |
+| 0xFF | CMD_END | (none) |
+
+### Phase 2-4 (Not Yet Implemented)
+Tags 0x0A-0x1A are reserved for: lists, preformatted text, blockquotes, alignment, tables, background images, animated GIFs, marquee, form inputs.
+
+### Mode Switching
+- Server sends `MSG_MODE_SWITCH` to tell client which mode to use
+- Client keyboard/mouse routing changes based on `render_mode`
+- In native mode: arrow keys scroll locally, link clicks send `MSG_NATIVE_CLICK`
+- In screenshot mode: everything works as before (no native code paths activated)
+- Status bar shows `[N]` or `[S]` prefix to indicate mode
+
+### Memory Budget (native mode, added to base ~755 KB)
+| Allocation | Size |
+|------------|------|
+| content_buf | 200 KB |
+| image_pool | 512 KB |
+| links + images structs | ~6 KB |
+| **Total native** | **~718 KB** |

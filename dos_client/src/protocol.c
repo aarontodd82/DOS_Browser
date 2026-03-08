@@ -81,6 +81,13 @@ int proto_encode_nav_action(uint8_t *buf, uint8_t action)
 }
 
 
+int proto_encode_native_click(uint8_t *buf, uint16_t link_id)
+{
+    buf[0] = (uint8_t)(link_id & 0xFF);
+    buf[1] = (uint8_t)(link_id >> 8);
+    return 2;
+}
+
 int proto_decode_header(const uint8_t *buf, msg_header_t *header)
 {
     const msg_header_t *src = (const msg_header_t *)buf;

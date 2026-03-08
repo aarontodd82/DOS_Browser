@@ -26,6 +26,7 @@
 #include "cursor.h"
 #include "chrome.h"
 #include "interact.h"
+#include "native.h"
 
 #define TILE_SIZE 16
 
@@ -168,18 +169,25 @@ static int run_browser(Config *cfg, VideoConfig *vc, net_context_t *passed_ctx)
     SoftCursor cursor;
     ChromeState chrome;
     InteractCtx interact;
+    NativeCtx native;
     MouseState mouse;
     int rc;
     msg_header_t header;
     uint16_t payload_len;
     server_hello_t server_hello;
     int quit = 0;
+    int render_mode = 0;  /* 0 = screenshot, 1 = native */
 
     /* Initialize subsystems */
     cursor_init(&cursor);
     chrome_init(&chrome, vc);
     interact_init(&interact);
     memset(&mouse, 0, sizeof(mouse));
+
+    /* Initialize native renderer */
+    if (native_init(&native, vc) != 0) {
+        printf("WARNING: Native renderer init failed\n");
+    }
 
     chrome_set_status(&chrome, "Connected");
 
@@ -309,6 +317,45 @@ static int run_browser(Config *cfg, VideoConfig *vc, net_context_t *passed_ctx)
                 interact_parse_map(&interact, payload_buf, payload_len);
                 break;
 
+            case MSG_MODE_SWITCH:
+                if (payload_len >= 1) {
+                    int new_mode = payload_buf[0];
+                    if (new_mode == 1) {
+                        /* Switch to native mode (always reset) */
+                        render_mode = 1;
+                        native_reset(&native);
+                        native.active = 1;
+                        chrome_set_status(&chrome, "[N] Native mode");
+                        chrome_draw_status(&chrome, vc);
+                    } else if (new_mode == 0) {
+                        /* Switch to screenshot mode */
+                        render_mode = 0;
+                        native.active = 0;
+                        /* Clear content area for clean screenshot */
+                        video_fill_rect(vc, 0, vc->chrome_height,
+                                        vc->width, vc->content_height,
+                                        0);
+                        video_mark_dirty(vc, 0, vc->chrome_height,
+                                         vc->width, vc->content_height);
+                        chrome_set_status(&chrome, "[S] Screenshot mode");
+                        chrome_draw_status(&chrome, vc);
+                    }
+                }
+                break;
+
+            case MSG_NATIVE_CONTENT:
+                native_parse_content(&native, payload_buf, payload_len,
+                                     header.flags);
+                if (!(header.flags & FLAG_CONTINUED)) {
+                    frame_received = 1;
+                }
+                break;
+
+            case MSG_NATIVE_IMAGE:
+                native_parse_image(&native, payload_buf, payload_len);
+                native.needs_redraw = 1;  /* re-render to show image */
+                break;
+
             default:
                 break;
             }
@@ -351,7 +398,49 @@ static int run_browser(Config *cfg, VideoConfig *vc, net_context_t *passed_ctx)
                     continue;
                 }
 
-                /* Priority 2: Forwarding mode → send keys to server */
+                /* Priority 2: Native mode → handle scroll keys locally */
+                if (render_mode == 1) {
+                    int handled = 0;
+                    if (key.extended) {
+                        switch (key.scancode) {
+                        case 0x48: /* Up arrow */
+                            native_scroll(&native, -font_char_height(1));
+                            handled = 1;
+                            break;
+                        case 0x50: /* Down arrow */
+                            native_scroll(&native, font_char_height(1));
+                            handled = 1;
+                            break;
+                        case 0x49: /* Page Up */
+                            native_scroll(&native, -(int32_t)native.viewport_h);
+                            handled = 1;
+                            break;
+                        case 0x51: /* Page Down */
+                            native_scroll(&native, (int32_t)native.viewport_h);
+                            handled = 1;
+                            break;
+                        case 0x47: /* Home */
+                            native.scroll_y = 0;
+                            native.needs_redraw = 1;
+                            handled = 1;
+                            break;
+                        case 0x4F: /* End */
+                            native.scroll_y = native.max_scroll_y;
+                            native.needs_redraw = 1;
+                            handled = 1;
+                            break;
+                        }
+                    }
+                    /* ESC to quit (even in native mode) */
+                    if (!handled && key.ascii == 27) {
+                        quit = 1;
+                        break;
+                    }
+                    if (handled) continue;
+                    /* Fall through for unhandled keys */
+                }
+
+                /* Priority 3: Forwarding mode → send keys to server */
                 if (interact.mode == INTERACT_MODE_FORWARD) {
                     /* Escape exits forwarding mode */
                     if (key.ascii == 27) {
@@ -374,6 +463,14 @@ static int run_browser(Config *cfg, VideoConfig *vc, net_context_t *passed_ctx)
                         }
                         net_send_message(&ctx, MSG_KEY_EVENT, kbuf, klen);
                     }
+                    continue;
+                }
+
+                /* F5 = toggle rendering mode */
+                if (key.extended && key.scancode == 0x3F) {
+                    send_nav_action(&ctx, NAV_TOGGLE_MODE);
+                    chrome_set_status(&chrome, "Switching mode...");
+                    chrome_draw_status(&chrome, vc);
                     continue;
                 }
 
@@ -455,55 +552,73 @@ static int run_browser(Config *cfg, VideoConfig *vc, net_context_t *passed_ctx)
                 /* Only process if actually in content area */
                 if (mouse.y > vc->chrome_height &&
                     mouse.y < chrome.status_y) {
-                    uint16_t mx = mouse.x;
-                    uint16_t my = mouse.y - vc->chrome_height;
-                    InteractElem *elem;
 
-                    /* Check interaction map for hit */
-                    elem = interact_hit_test(&interact, mx, my);
-                    if (elem) {
-                        interact_handle_click(&interact, elem, &ctx,
-                                              mx, my, mouse.buttons);
-                        /* Show status for forwarding mode */
-                        if (interact.mode == INTERACT_MODE_FORWARD) {
-                            chrome_set_status(&chrome, "DIRECT mode (ESC to exit)");
+                    if (render_mode == 1) {
+                        /* Native mode: hit test against link rects */
+                        int link_id = native_hit_test(&native,
+                                                       mouse.x, mouse.y);
+                        if (link_id >= 0) {
+                            uint8_t cbuf[4];
+                            int clen = proto_encode_native_click(
+                                cbuf, (uint16_t)link_id);
+                            net_send_message(&ctx, MSG_NATIVE_CLICK,
+                                             cbuf, clen);
+                            chrome_set_status(&chrome, "Loading...");
                             chrome_draw_status(&chrome, vc);
                         }
                     } else {
-                        interact_handle_miss(&interact, &ctx,
-                                             mx, my, mouse.buttons);
+                        /* Screenshot mode: use interaction map */
+                        uint16_t mx = mouse.x;
+                        uint16_t my = mouse.y - vc->chrome_height;
+                        InteractElem *elem;
+
+                        elem = interact_hit_test(&interact, mx, my);
+                        if (elem) {
+                            interact_handle_click(&interact, elem, &ctx,
+                                                  mx, my, mouse.buttons);
+                            if (interact.mode == INTERACT_MODE_FORWARD) {
+                                chrome_set_status(&chrome,
+                                    "DIRECT mode (ESC to exit)");
+                                chrome_draw_status(&chrome, vc);
+                            }
+                        } else {
+                            interact_handle_miss(&interact, &ctx,
+                                                 mx, my, mouse.buttons);
+                        }
                     }
                 }
                 break;
             }
             input_mouse_event_sent(mouse.x, mouse.y);
         }
-        if (input_mouse_released(&mouse, 0)) {
-            /* Only send release to content area */
-            if (mouse.y > vc->chrome_height &&
+        if (render_mode == 0) {
+            /* Screenshot mode: send mouse release and move to server */
+            if (input_mouse_released(&mouse, 0)) {
+                if (mouse.y > vc->chrome_height &&
+                    mouse.y < chrome.status_y) {
+                    uint16_t mx = mouse.x;
+                    uint16_t my = mouse.y - vc->chrome_height;
+                    uint8_t mbuf[6];
+                    int mlen = proto_encode_mouse_event(mbuf, mx, my,
+                                                        mouse.buttons,
+                                                        MOUSE_RELEASE);
+                    net_send_message(&ctx, MSG_MOUSE_EVENT, mbuf, mlen);
+                }
+                input_mouse_event_sent(mouse.x, mouse.y);
+            }
+
+            /* 6. Throttled mouse move (content area only) */
+            if (input_should_send_mouse_move(&mouse) &&
+                mouse.y > vc->chrome_height &&
                 mouse.y < chrome.status_y) {
                 uint16_t mx = mouse.x;
                 uint16_t my = mouse.y - vc->chrome_height;
                 uint8_t mbuf[6];
                 int mlen = proto_encode_mouse_event(mbuf, mx, my,
-                                                    mouse.buttons,
-                                                    MOUSE_RELEASE);
+                                                    mouse.buttons, MOUSE_MOVE);
                 net_send_message(&ctx, MSG_MOUSE_EVENT, mbuf, mlen);
+                input_mouse_event_sent(mouse.x, mouse.y);
             }
-            input_mouse_event_sent(mouse.x, mouse.y);
-        }
-
-        /* 6. Throttled mouse move (content area only) */
-        if (input_should_send_mouse_move(&mouse) &&
-            mouse.y > vc->chrome_height &&
-            mouse.y < chrome.status_y) {
-            uint16_t mx = mouse.x;
-            uint16_t my = mouse.y - vc->chrome_height;
-            uint8_t mbuf[6];
-            int mlen = proto_encode_mouse_event(mbuf, mx, my,
-                                                mouse.buttons, MOUSE_MOVE);
-            net_send_message(&ctx, MSG_MOUSE_EVENT, mbuf, mlen);
-            input_mouse_event_sent(mouse.x, mouse.y);
         }
 
         /* 7. Tick cursor blink */
@@ -511,13 +626,18 @@ static int run_browser(Config *cfg, VideoConfig *vc, net_context_t *passed_ctx)
             chrome_draw_urlbar(&chrome, vc);
         }
 
-        /* 7b. Update cursor shape based on interaction map */
+        /* 7b. Update cursor shape based on mode */
         if (mouse.y > vc->chrome_height && mouse.y < chrome.status_y) {
-            interact_update_cursor(&interact, &cursor,
-                                   mouse.x,
-                                   mouse.y - vc->chrome_height);
+            if (render_mode == 1) {
+                native_update_cursor(&native, &cursor,
+                                     mouse.x, mouse.y);
+            } else {
+                interact_update_cursor(&interact, &cursor,
+                                       mouse.x,
+                                       mouse.y - vc->chrome_height);
+            }
         } else {
-            interact_update_cursor(&interact, &cursor, 0xFFFF, 0xFFFF);
+            cursor_set_shape(&cursor, CURSOR_ARROW);
         }
 
         /* 8. Save under + draw cursor at new position */
@@ -540,6 +660,11 @@ static int run_browser(Config *cfg, VideoConfig *vc, net_context_t *passed_ctx)
             }
         }
 
+        /* 8b. Native mode: render content if dirty */
+        if (render_mode == 1 && native.needs_redraw && native.hdr_parsed) {
+            native_render(&native, vc);
+        }
+
         /* 9. Pump TCP before flush to keep ACKs flowing */
         net_poll();
 
@@ -559,6 +684,7 @@ static int run_browser(Config *cfg, VideoConfig *vc, net_context_t *passed_ctx)
     }
 
 disconnect:
+    native_shutdown(&native);
     render_shutdown(&render);
     net_close(&ctx);
     net_shutdown();

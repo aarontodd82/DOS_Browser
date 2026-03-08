@@ -42,11 +42,21 @@ MSG_STATUS = 0x87
 MSG_INPUT_STATE = 0x88
 MSG_KEEPALIVE_ACK = 0xF1
 
+# --- Native Rendering Message Types ---
+# Client -> Server
+MSG_NATIVE_CLICK = 0x16
+
+# Server -> Client
+MSG_NATIVE_CONTENT = 0x89
+MSG_NATIVE_IMAGE = 0x8A
+MSG_MODE_SWITCH = 0x8B
+
 # --- Nav Actions ---
 NAV_BACK = 0
 NAV_FORWARD = 1
 NAV_RELOAD = 2
 NAV_STOP = 3
+NAV_TOGGLE_MODE = 4
 
 # --- Element Types ---
 ELEM_LINK = 0x00
@@ -373,6 +383,69 @@ def encode_cursor_shape(cursor_type, hotspot_x=0, hotspot_y=0,
     header = struct.pack('<BBBBB', cursor_type, hotspot_x, hotspot_y,
                          width, height)
     return header + pixels
+
+
+# --- Native Rendering Payloads ---
+
+def encode_native_content(bg_color, link_count, image_count, content_height,
+                          command_stream):
+    """Encode MSG_NATIVE_CONTENT payload.
+
+    Args:
+        bg_color: palette index for page background
+        link_count: number of links in the content
+        image_count: number of images in the content
+        content_height: total content height in pixels
+        command_stream: binary command stream bytes
+
+    Returns:
+        bytes of the complete payload (7-byte header + commands)
+    """
+    header = struct.pack('<BHHH', bg_color, link_count, image_count,
+                         content_height)
+    return header + command_stream
+
+
+def encode_native_image(image_id, width, height, rle_data):
+    """Encode MSG_NATIVE_IMAGE payload.
+
+    Args:
+        image_id: unique image identifier
+        width, height: image dimensions in pixels
+        rle_data: RLE-compressed palette-indexed pixel data
+
+    Returns:
+        bytes of the complete payload, or None if too large
+    """
+    # compressed_size is u32 to handle large images
+    header = struct.pack('<HHHI', image_id, width, height, len(rle_data))
+    payload = header + rle_data
+    # Must fit in a single message (payload_len is uint16)
+    if len(payload) > 60000:
+        return None
+    return payload
+
+
+def encode_mode_switch(mode):
+    """Encode MSG_MODE_SWITCH payload.
+
+    Args:
+        mode: 0=screenshot, 1=native
+
+    Returns:
+        1-byte payload
+    """
+    return struct.pack('<B', mode)
+
+
+def decode_native_click(data):
+    """Decode MSG_NATIVE_CLICK payload.
+
+    Returns:
+        dict with 'link_id'
+    """
+    link_id = struct.unpack('<H', data[:2])[0]
+    return {'link_id': link_id}
 
 
 # --- Message Splitting ---
