@@ -37,6 +37,12 @@ from protocol import (
 )
 
 
+    # Number of tiles to compress and send per progressive batch.
+    # Lower = faster time-to-first-tile, higher = less protocol overhead.
+    # 40 tiles × ~140 bytes avg = ~5.6KB per batch → 16ms at 350KB/s.
+PROGRESSIVE_BATCH_SIZE = 40
+
+
 class RetroSurfServer:
     """Main server managing browser sessions and client connections."""
 
@@ -154,13 +160,19 @@ class RetroSurfServer:
             # Small delay for page to settle
             await asyncio.sleep(0.5)
 
-            # Send initial full frame
-            result = await session.capture_frame()
-            if result:
-                tiles, _ = result
-                if tiles:
-                    await self._send_tiles(writer, tiles, seq, full=True)
-                    print(f"[Server] Sent initial frame ({len(tiles)} tiles)")
+            # Send initial full frame (progressive)
+            prep = await session.capture_and_prepare()
+            if prep:
+                indexed, changed, scroll_dy = prep
+                if changed:
+                    count = await self._send_progressive(
+                        writer, session, indexed, changed, seq,
+                        scroll_dy=scroll_dy, msg_type=MSG_FRAME_FULL,
+                    )
+                    session.pipeline.commit_frame(indexed)
+                    print(f"[Server] Sent initial frame ({count} tiles, progressive)")
+                else:
+                    session.pipeline.commit_frame(indexed)
 
             # Send initial interaction map
             elements, scroll_y, scroll_height = await session.get_interaction_map()
@@ -180,10 +192,14 @@ class RetroSurfServer:
             frame_ack_event = asyncio.Event()
             frame_ack_event.set()
 
+            # Scroll coalescing: buffer rapid scroll events and execute
+            # them as one combined scroll before the next frame capture
+            scroll_accum = {'dy_pixels': 0, 'last_time': 0}
+
             # Run push and receive loops concurrently
             await asyncio.gather(
-                self._push_loop(writer, session, seq, frame_ack_event),
-                self._receive_loop(reader, writer, session, seq, frame_ack_event),
+                self._push_loop(writer, session, seq, frame_ack_event, scroll_accum),
+                self._receive_loop(reader, writer, session, seq, frame_ack_event, scroll_accum),
             )
 
         except asyncio.IncompleteReadError:
@@ -204,13 +220,17 @@ class RetroSurfServer:
                 pass
             print(f"[Server] Client {addr} connection closed")
 
-    async def _push_loop(self, writer, session, seq, frame_ack_event):
-        """Frame push loop — streams as fast as the client can receive.
+    async def _push_loop(self, writer, session, seq, frame_ack_event,
+                         scroll_accum):
+        """Frame push loop with progressive tile streaming.
+
+        Tiles are compressed and sent in small batches (~40 tiles each),
+        interleaving CPU work with network transfer. The DOS client sees
+        tiles start appearing ~110ms after capture instead of ~300ms.
 
         Two modes:
         - ACTIVE: Recent frames had tile changes. Capture immediately after
-          each ACK with zero delay. This maximizes throughput during page
-          loads and content changes.
+          each ACK with zero delay.
         - IDLE: No tile changes for several frames. Poll for dirty state
           with short intervals to avoid wasting CPU on screenshots.
         """
@@ -219,18 +239,25 @@ class RetroSurfServer:
         ack_timeout = 10.0
         last_interaction_time = 0
         last_status_time = 0
+        SCROLL_COALESCE_MS = 40  # Wait this long for more scroll events
 
         # After this many consecutive frames with no tile changes,
         # switch from active to idle (polling) mode
         IDLE_THRESHOLD = 3
         empty_frames = 0
+        last_capture_time = 0
+        NAV_BURST_MIN_INTERVAL = 0.15  # 150ms between captures during page load
 
         while True:
             # Wait for client ACK (or timeout as safety net)
+            t_ack_wait = time.perf_counter()
             try:
                 await asyncio.wait_for(frame_ack_event.wait(), timeout=ack_timeout)
             except asyncio.TimeoutError:
                 pass
+            t_ack_got = time.perf_counter()
+            if t_ack_got - t_ack_wait > 0.01:
+                print(f"[Timing] ACK wait: {(t_ack_got-t_ack_wait)*1000:.1f}ms")
             frame_ack_event.clear()
 
             # IDLE MODE: poll for dirty state before capturing
@@ -264,21 +291,51 @@ class RetroSurfServer:
                             pass
                         last_status_time = now
 
-                    await asyncio.sleep(0.01)  # 10ms poll (was 50ms)
+                    await asyncio.sleep(0.01)  # 10ms poll
 
             # ACTIVE MODE: capture immediately, no delay
 
-            # Capture and send frame
+            # Flush any accumulated scroll events before capturing.
+            # Waits briefly for more events to coalesce rapid scrolling.
+            if scroll_accum['dy_pixels'] != 0:
+                elapsed = (time.time() - scroll_accum['last_time']) * 1000
+                if elapsed < SCROLL_COALESCE_MS:
+                    await asyncio.sleep((SCROLL_COALESCE_MS - elapsed) / 1000)
+                total_pixels = scroll_accum['dy_pixels']
+                scroll_accum['dy_pixels'] = 0
+                scroll_accum['last_time'] = 0
+                await session.inject_scroll_pixels(total_pixels)
+                await asyncio.sleep(0.01)  # Let browser settle
+
+            # During page load burst, enforce minimum interval between
+            # captures so Chrome has time to render more content per frame.
+            # Reduces intermediate frames from 4-5 to 2-3.
+            if time.time() < session._nav_burst_until:
+                since_last = time.time() - last_capture_time
+                if since_last < NAV_BURST_MIN_INTERVAL:
+                    await asyncio.sleep(NAV_BURST_MIN_INTERVAL - since_last)
+
+            # Capture screenshot, dither/quantize, detect changed tiles
             frame_sent = False
-            result = await session.capture_frame()
-            if result:
-                tiles, scroll_dy = result
-                if tiles:
-                    await self._send_tiles(writer, tiles, seq,
-                                           scroll_dy=scroll_dy)
+            last_capture_time = time.time()
+            prep = await session.capture_and_prepare()
+            if prep:
+                indexed, changed, scroll_dy = prep
+                if changed:
+                    # Progressive streaming: compress + send in batches
+                    # Tiles start flowing to DOS immediately — url+title
+                    # update happens AFTER to avoid 300-400ms stall
+                    await self._send_progressive(
+                        writer, session, indexed, changed, seq,
+                        scroll_dy=scroll_dy,
+                    )
+                    session.pipeline.commit_frame(indexed)
+                    await session.update_page_info()
                     frame_sent = True
                     empty_frames = 0
                 else:
+                    session.pipeline.commit_frame(indexed)
+                    await session.update_page_info()
                     empty_frames += 1
             else:
                 empty_frames += 1
@@ -305,7 +362,8 @@ class RetroSurfServer:
                     pass
                 last_status_time = now
 
-    async def _receive_loop(self, reader, writer, session, seq, frame_ack_event):
+    async def _receive_loop(self, reader, writer, session, seq, frame_ack_event,
+                            scroll_accum):
         """Process incoming messages from the DOS client."""
         while True:
             # Read message header
@@ -326,7 +384,17 @@ class RetroSurfServer:
                 await self._handle_key(session, payload)
 
             elif msg_type == MSG_SCROLL_EVENT:
-                await self._handle_scroll(session, payload)
+                # Buffer scroll events for coalescing instead of executing
+                # immediately. The push_loop flushes accumulated scroll
+                # before each frame capture, combining rapid scroll events.
+                evt = decode_scroll_event(payload)
+                pixels = evt['amount'] * 48
+                if evt['direction'] == 1:
+                    pixels = -pixels
+                scroll_accum['dy_pixels'] += pixels
+                scroll_accum['last_time'] = time.time()
+                session._dirty = True
+                session._interaction_dirty = True
 
             elif msg_type == MSG_TEXT_INPUT:
                 await self._handle_text_input(session, payload)
@@ -406,6 +474,65 @@ class RetroSurfServer:
         msg = encode_message(msg_type, payload, seq.next())
         writer.write(msg)
         await writer.drain()
+
+    async def _send_progressive(self, writer, session, indexed, changed,
+                                 seq, scroll_dy=0, msg_type=MSG_FRAME_DELTA):
+        """Compress and send tiles in progressive batches.
+
+        Instead of compressing ALL tiles then sending, this compresses
+        a small batch, sends it immediately, then compresses the next.
+        The DOS client sees tiles start appearing while the server is
+        still processing the rest.
+
+        Returns:
+            Total number of tiles sent.
+        """
+        batch_size = PROGRESSIVE_BATCH_SIZE
+        total = len(changed)
+        t_start = time.perf_counter()
+
+        for batch_start in range(0, total, batch_size):
+            batch_end = min(batch_start + batch_size, total)
+            batch_indices = changed[batch_start:batch_end]
+
+            # Compress this batch
+            t_comp = time.perf_counter()
+            tiles = session.pipeline.compress_tile_batch(indexed, batch_indices)
+
+            # Encode protocol message
+            payload = encode_frame_delta(tiles)
+
+            # Set FLAGS_CONTINUED on all but the last batch
+            is_last = (batch_end >= total)
+            flags = 0 if is_last else FLAG_CONTINUED
+
+            # First batch carries tile-aligned scroll_dy in reserved field.
+            # Must match the rounding used by prepare_indexed() so the
+            # client's video_shift_content() aligns with the server's shift.
+            if batch_start == 0 and scroll_dy != 0:
+                tile_size = session.pipeline.tile_size
+                aligned_dy = round(scroll_dy / tile_size) * tile_size
+                reserved = max(-32768, min(32767, aligned_dy))
+            else:
+                reserved = 0
+
+            msg = encode_message(msg_type, payload, seq.next(), flags, reserved)
+            writer.write(msg)
+            # Drain after each batch — pushes data to TCP immediately
+            # so the DOS client can start receiving while we compress
+            # the next batch.
+            await writer.drain()
+            t_sent = time.perf_counter()
+
+            if batch_start == 0:
+                print(f"[Timing] First batch ({len(batch_indices)} tiles, "
+                      f"{len(payload)}B): compress+send={(t_sent-t_comp)*1000:.1f}ms")
+
+        t_end = time.perf_counter()
+        print(f"[Timing] All {total} tiles sent in {(t_end-t_start)*1000:.1f}ms "
+              f"({total // batch_size + 1} batches)")
+
+        return total
 
     async def _send_tiles(self, writer, tiles, seq, full=False, scroll_dy=0):
         """Send tile data, splitting into multiple messages if needed.

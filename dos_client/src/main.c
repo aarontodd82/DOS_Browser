@@ -389,11 +389,11 @@ static int run_browser(Config *cfg, VideoConfig *vc, net_context_t *passed_ctx)
                     int slen;
                     switch (key.scancode) {
                     case 0x49: /* Page Up - scroll UP (direction=1) */
-                        slen = proto_encode_scroll_event(sbuf, 1, 9);
+                        slen = proto_encode_scroll_event(sbuf, 1, 5);
                         net_send_message(&ctx, MSG_SCROLL_EVENT, sbuf, slen);
                         break;
                     case 0x51: /* Page Down - scroll DOWN (direction=0) */
-                        slen = proto_encode_scroll_event(sbuf, 0, 9);
+                        slen = proto_encode_scroll_event(sbuf, 0, 5);
                         net_send_message(&ctx, MSG_SCROLL_EVENT, sbuf, slen);
                         break;
                     case 0x48: /* Up arrow - scroll UP (direction=1) */

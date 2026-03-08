@@ -525,6 +525,76 @@ class BrowserSession:
         tiles = self.pipeline.process_frame(screenshot_bytes, scroll_dy=scroll_dy)
         return (tiles, scroll_dy)
 
+    async def capture_and_prepare(self):
+        """Capture screenshot + dither/quantize + detect changed tiles.
+
+        Separated from tile compression so the server can compress and
+        send tiles in progressive batches, interleaving CPU work with
+        network transfer. The DOS client sees tiles start arriving
+        ~110ms after capture instead of ~300ms.
+
+        Returns:
+            (indexed, changed_indices, scroll_dy) or None if failed.
+            - indexed: (H, W) uint8 palette index image
+            - changed_indices: list of tile indices that changed
+            - scroll_dy: vertical scroll delta in pixels
+        """
+        self._dirty = False
+        self.last_activity = time.time()
+
+        t0 = time.perf_counter()
+
+        # Track scroll position
+        scroll_dy = 0
+        try:
+            current_sy = await self.page.evaluate('window.scrollY')
+            scroll_dy = int(current_sy - self._last_scroll_y)
+            self._last_scroll_y = current_sy
+        except Exception:
+            pass
+
+        t1 = time.perf_counter()
+
+        # Capture screenshot
+        try:
+            screenshot_bytes = await self.page.screenshot(
+                type='jpeg',
+                quality=self.config.get('screenshot_quality', 70),
+                caret='initial',
+            )
+        except Exception as e:
+            print(f"[Session {self.session_id}] Screenshot failed: {e}")
+            return None
+
+        t2 = time.perf_counter()
+
+        # Prepare indexed image and find changed tiles (no compression yet)
+        indexed, changed_indices = self.pipeline.prepare_indexed(
+            screenshot_bytes, scroll_dy=scroll_dy
+        )
+
+        t3 = time.perf_counter()
+
+        if changed_indices:
+            print(f"[Timing] scrollY={(t1-t0)*1000:.1f}ms  screenshot={(t2-t1)*1000:.1f}ms  "
+                  f"dither+lut+detect={(t3-t2)*1000:.1f}ms  "
+                  f"total={(t3-t0)*1000:.1f}ms  changed={len(changed_indices)} tiles")
+
+        return indexed, changed_indices, scroll_dy
+
+    async def update_page_info(self):
+        """Update URL and title from the page. Call after tiles are sent.
+
+        This can block 300-400ms during page loads (page.title() waits
+        for the page to be ready), so it must NOT be on the critical
+        path before tile streaming.
+        """
+        try:
+            self.current_url = self.page.url
+            self.page_title = await self.page.title()
+        except Exception:
+            pass
+
     async def get_interaction_map(self):
         """Detect interactive elements on the current page.
 
@@ -656,28 +726,45 @@ class BrowserSession:
             print(f"[Session {self.session_id}] Text input failed: {e}")
 
     async def inject_scroll(self, direction, amount):
-        """Scroll the page.
+        """Scroll the page by a tile-aligned amount.
+
+        Uses JavaScript scrollTo() with position snapped to tile boundary
+        instead of mouse.wheel(), which can produce non-tile-aligned
+        scroll positions due to Chrome's scroll processing.
 
         Args:
             direction: 0=down, 1=up
-            amount: number of "lines" to scroll
+            amount: number of "lines" to scroll (each line = 48px = 3 tiles)
         """
         self.last_activity = time.time()
 
-        pixels = amount * 48  # Tile-aligned: 48px = 3 × 16px tiles
+        pixels = amount * 48  # 48px = 3 × 16px tiles
         if direction == 1:
             pixels = -pixels
 
+        await self.inject_scroll_pixels(pixels)
+
+    async def inject_scroll_pixels(self, pixels):
+        """Scroll by an exact pixel amount, snapping to tile boundary.
+
+        Args:
+            pixels: signed pixel delta (positive = scroll down)
+        """
+        self.last_activity = time.time()
+
         try:
-            await self.page.mouse.wheel(0, pixels)
+            await self.page.evaluate(f'''(() => {{
+                const target = window.scrollY + ({pixels});
+                const snapped = Math.round(target / 16) * 16;
+                const maxScroll = document.documentElement.scrollHeight - window.innerHeight;
+                window.scrollTo(0, Math.max(0, Math.min(snapped, maxScroll)));
+            }})()''')
         except Exception:
             try:
                 await self.page.evaluate(f'window.scrollBy(0, {pixels})')
             except Exception:
                 pass
 
-        # Set dirty AFTER scroll completes to prevent push loop from
-        # capturing a pre-scroll frame during the await above
         self._dirty = True
         self._interaction_dirty = True
 

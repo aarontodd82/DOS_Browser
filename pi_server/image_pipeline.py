@@ -189,6 +189,13 @@ class ImagePipeline:
         # Previous frame for delta detection (None until first frame)
         self.prev_indexed = None
 
+        # Minimum changed pixels per tile to consider it dirty.
+        # Filters JPEG artifacts + sub-pixel rendering noise.
+        # 4 out of 256 pixels (1.6%) — conservative enough to catch
+        # real changes (typed char = 30-60+ pixels) while filtering
+        # JPEG noise (typically 1-10 pixels per tile).
+        self.change_threshold = 4
+
         # Stats
         self.frame_count = 0
 
@@ -227,9 +234,13 @@ class ImagePipeline:
         # Map to palette indices via LUT
         indexed = apply_lut(img_dithered, self.lut)
 
-        # Shift prev_indexed to match scroll offset (reduces changed tiles)
-        if self.prev_indexed is not None and scroll_dy != 0 and scroll_dy % self.tile_size == 0:
-            self.prev_indexed = self._shift_prev(self.prev_indexed, scroll_dy)
+        # Shift prev_indexed to match scroll offset (reduces changed tiles).
+        # Round to nearest tile boundary — the change threshold handles
+        # any misaligned pixels from rounding.
+        if self.prev_indexed is not None and scroll_dy != 0:
+            aligned_dy = round(scroll_dy / self.tile_size) * self.tile_size
+            if aligned_dy != 0:
+                self.prev_indexed = self._shift_prev(self.prev_indexed, aligned_dy)
 
         # Find changed tiles
         if self.prev_indexed is None:
@@ -265,6 +276,80 @@ class ImagePipeline:
         self.frame_count += 1
 
         return result
+
+    def prepare_indexed(self, image_input, scroll_dy=0):
+        """Process a screenshot through dither+LUT and detect changed tiles.
+
+        This is the first half of the pipeline, separated from compression
+        so that tiles can be compressed and sent in progressive batches
+        (interleaving compression with network transfer).
+
+        Args:
+            image_input: bytes (JPEG/PNG), PIL.Image, or numpy array
+            scroll_dy: vertical scroll delta for shift optimization
+
+        Returns:
+            (indexed, changed_indices) where:
+              indexed: (H, W) uint8 palette index image
+              changed_indices: list of tile indices that changed
+        """
+        img_rgb = self._decode_input(image_input)
+        img_rgb = self._fit_to_size(img_rgb)
+        img_dithered = apply_ordered_dither(
+            img_rgb, BAYER_4x4, self.dither_strength
+        )
+        indexed = apply_lut(img_dithered, self.lut)
+
+        # Shift prev_indexed to match scroll offset (rounded to tile boundary)
+        if self.prev_indexed is not None and scroll_dy != 0:
+            aligned_dy = round(scroll_dy / self.tile_size) * self.tile_size
+            if aligned_dy != 0:
+                self.prev_indexed = self._shift_prev(self.prev_indexed, aligned_dy)
+
+        # Find changed tiles
+        if self.prev_indexed is None:
+            changed_indices = list(range(self.tile_cols * self.tile_rows))
+        else:
+            changed_indices = self._find_changed_tiles(indexed)
+
+        return indexed, changed_indices
+
+    def compress_tile_batch(self, indexed, tile_indices):
+        """Compress a batch of tiles from an indexed image.
+
+        Called repeatedly with different subsets of changed tiles to
+        enable progressive streaming (compress batch -> send -> repeat).
+
+        Args:
+            indexed: (H, W) uint8 palette index image
+            tile_indices: list of tile indices to compress
+
+        Returns:
+            list of (tile_index, compressed_bytes) tuples
+        """
+        result = []
+        for tile_idx in tile_indices:
+            row = tile_idx // self.tile_cols
+            col = tile_idx % self.tile_cols
+            y0 = row * self.tile_size
+            x0 = col * self.tile_size
+            y1 = min(y0 + self.tile_size, self.height)
+            x1 = min(x0 + self.tile_size, self.width)
+
+            tile_data = indexed[y0:y1, x0:x1]
+            raw_bytes = tile_data.tobytes()
+            compressed = rle_compress(raw_bytes)
+            result.append((tile_idx, compressed))
+
+        return result
+
+    def commit_frame(self, indexed):
+        """Update prev_indexed after a frame has been fully sent.
+
+        Must be called after all batches for a frame are sent.
+        """
+        self.prev_indexed = indexed.copy()
+        self.frame_count += 1
 
     def process_frame_staged(self, image_input):
         """Process a frame and return intermediate results for debugging.
@@ -410,21 +495,23 @@ class ImagePipeline:
         return img_rgb
 
     def _find_changed_tiles(self, indexed):
-        """Find tile indices where any pixel differs from the previous frame.
+        """Find tile indices where enough pixels differ from the previous frame.
 
-        Uses a block-reduce approach for efficiency: reshape the diff mask
-        into tile-shaped blocks and check each block with .any().
+        Uses count_nonzero with a threshold to filter JPEG compression
+        artifacts and sub-pixel rendering noise. A tile must have at least
+        change_threshold pixels different to be considered changed.
         """
         diff = indexed != self.prev_indexed  # (H, W) boolean
 
         changed = []
+        threshold = self.change_threshold
         for row in range(self.tile_rows):
             y0 = row * self.tile_size
             y1 = min(y0 + self.tile_size, self.height)
             for col in range(self.tile_cols):
                 x0 = col * self.tile_size
                 x1 = min(x0 + self.tile_size, self.width)
-                if np.any(diff[y0:y1, x0:x1]):
+                if np.count_nonzero(diff[y0:y1, x0:x1]) >= threshold:
                     changed.append(row * self.tile_cols + col)
 
         return changed

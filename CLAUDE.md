@@ -11,7 +11,7 @@ Historical design document: `DESIGN.md` — many sections are outdated. This fil
 ## Project Layout
 
 ```
-C:\Users\aaron\OneDrive\Documents\DOS_Browser\
+C:\Users\Aaron\Documents\DOS_Browser\
 ├── DESIGN.md                    # Historical design doc (outdated in many areas)
 ├── CLAUDE.md                    # This file - current source of truth
 │
@@ -69,14 +69,16 @@ C:\Users\aaron\OneDrive\Documents\DOS_Browser\
 
 ## How to Build
 
+**From Claude Code (MSYS2 bash shell), run gnumake directly:**
 ```
-cd dos_client
-build.bat
+"C:/Users/Aaron/Documents/DOS_Browser/tools/watt32/util/win32/gnumake.exe" -f "C:/Users/Aaron/Documents/DOS_Browser/dos_client/Makefile" -C "C:/Users/Aaron/Documents/DOS_Browser/dos_client"
 ```
 
-This calls `gnumake.exe` which invokes `i586-pc-msdosdjgpp-gcc.exe` to compile
-all `src/*.c` files into `build/RETRO.EXE`. All paths are auto-detected from
-the Makefile relative to the project root.
+`build.bat` does the same thing but only works from `cmd.exe`, not from bash/MSYS2.
+
+This invokes `i586-pc-msdosdjgpp-gcc.exe` to compile all `src/*.c` files into
+`build/RETRO.EXE`. All paths are auto-detected from the Makefile relative to
+the project root.
 
 ## How to Test
 
