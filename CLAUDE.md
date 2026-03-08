@@ -315,9 +315,18 @@ For simple pages (retro/old-web sites), the server extracts the page's content s
 
 ### Key Files
 - `pi_server/complexity_detector.py` — Page scoring via JS evaluation
-- `pi_server/content_extractor.py` — DOM walking, content extraction
-- `pi_server/native_encoder.py` — Content tree → binary command stream + image dithering
-- `dos_client/src/native.h/c` — DOS-side content parser, text renderer, word-wrap, scrolling, link hit testing
+- `pi_server/content_extractor.py` — JS Range API extraction, returns positioned commands with (x,y)
+- `pi_server/native_encoder.py` — Positioned commands → binary command stream + image dithering
+- `dos_client/src/native.h/c` — DOS-side display list renderer, doc-space hit testing, local scrolling
+
+### How It Works (v2 — Pre-Positioned Display List)
+The server uses the browser's own CSS layout engine to compute exact positions:
+- **Text**: Range API + `getClientRects()` to get per-line bounding rects. Each visual line becomes one CMD_TEXT with exact (x, y) in document space.
+- **Links**: `getClientRects()` on `<a>` elements → one CMD_LINK_RECT per visual line (for hit testing, not drawing)
+- **Images**: `getBoundingClientRect()` → CMD_IMAGE with (x, y, w, h)
+- **HRs**: `getBoundingClientRect()` → CMD_RECT with fill color
+
+The DOS client is a dumb renderer — just blit at `screen_y = doc_y - scroll_y + content_top`. No word-wrap, no heading spacing, no layout logic. Scrolling is instant and local.
 
 ### Protocol Messages
 - `MSG_MODE_SWITCH (0x8B)`: Server→Client, payload: mode(u8) 0=screenshot 1=native
@@ -325,22 +334,37 @@ For simple pages (retro/old-web sites), the server extracts the page's content s
 - `MSG_NATIVE_IMAGE (0x8A)`: Server→Client, pre-dithered image data
 - `MSG_NATIVE_CLICK (0x16)`: Client→Server, link_id(u16)
 
-### Command Stream Tags (MVP)
+### Command Stream Format (v2)
+7-byte header: bg_color(u8) link_count(u16) image_count(u16) doc_height(u16)
+
 | Tag | Name | Data |
 |-----|------|------|
-| 0x01 | CMD_TEXT | flags(u8) color(u8) font(u8) len(u16) text |
-| 0x02 | CMD_NEWLINE | count(u8) |
-| 0x03 | CMD_HEADING | level(u8) color(u8) len(u16) text |
-| 0x04 | CMD_LINK_START | link_id(u16) color(u8) hover_color(u8) |
-| 0x05 | CMD_LINK_END | (none) |
-| 0x06 | CMD_HR | color(u8) thickness(u8) |
-| 0x07 | CMD_IMAGE | image_id(u16) width(u16) height(u16) align(u8) |
-| 0x08 | CMD_SET_BG | color(u8) |
-| 0x09 | CMD_PARAGRAPH | (none) |
+| 0x01 | CMD_TEXT | x(u16) y(u16) color(u8) font(u8) flags(u8) len(u16) text |
+| 0x02 | CMD_LINK_RECT | link_id(u16) x(u16) y(u16) w(u16) h(u16) |
+| 0x03 | CMD_IMAGE | image_id(u16) x(u16) y(u16) w(u16) h(u16) |
+| 0x04 | CMD_RECT | x(u16) y(u16) w(u16) h(u16) color(u8) |
 | 0xFF | CMD_END | (none) |
 
-### Phase 2-4 (Not Yet Implemented)
-Tags 0x0A-0x1A are reserved for: lists, preformatted text, blockquotes, alignment, tables, background images, animated GIFs, marquee, form inputs.
+All coordinates are document-space (viewport-relative + scrollY), u16 (max 65535).
+
+### Known Gaps (vs Netscape Navigator)
+
+**Critical:**
+1. **Fixed-width font mismatch** — Browser uses proportional fonts but DOS uses 8px fixed-width. Text starts at correct x but extends too far right, causing overflow/overlap. This is the #1 visual issue.
+2. **No per-element backgrounds** — Only page bg_color renders. Table cells, divs with colored backgrounds show as blank page color. Old sites use colored cells heavily.
+3. **No table borders** — Content positions are correct (browser-computed) but no visible cell borders.
+
+**Important:**
+4. **No list markers** — Bullet points and numbers are CSS-generated content (::marker) that Range API can't see.
+5. **Image size gap** — Server resizes images to max ~300px, but browser may display them larger, leaving empty space around smaller actual image.
+
+**Already working (thanks to pre-positioned approach):**
+- Centered/right-aligned text (browser computes x position)
+- Blockquote indentation (browser computes indented x)
+- Heading sizes and bold weight
+- Link underlines, colors, hit testing
+- HR elements as filled rects
+- Inline images at browser-computed positions
 
 ### Mode Switching
 - Server sends `MSG_MODE_SWITCH` to tell client which mode to use
