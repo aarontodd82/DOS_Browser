@@ -386,12 +386,13 @@ Commands sorted by visual layer (painter's algorithm): bg_rect → bg_image → 
 Native mode scrolling uses backbuffer shift + partial strip redraw instead of full re-render:
 - `native_scroll()` accumulates `scroll_pending_dy` (clamped actual delta)
 - `native_render()` dispatches: if `|delta| < shift_h` → partial, else → full render
-- **Partial path**: `video_shift_content()` memmoves existing pixels, then only clears and redraws the thin exposed strip (e.g., 14 rows for arrow key vs 456 full viewport)
+- **Partial path**: `video_shift_content()` memmoves existing pixels, then only clears and redraws the thin exposed strip (e.g., 14 rows for arrow key, 240 rows for Page Up/Down)
 - **Shift area excludes status bar** (rows 24-467, not 24-479) to prevent status bar pixels from being dragged into content
 - **Link rects preserved across scrolls** — stored in document space, scroll-invariant, not rebuilt
 - **Render before cursor draw** — native_render runs before cursor_save_and_draw to prevent mouse cursor from being baked into memmove'd content
 - **Status bar redrawn after native render** — native content area overlaps status bar region
 - Home/End/image arrival reset `scroll_pending_dy = 0` to force full render
+- **Page Up/Down = 240px** (5 × 48px), matching screenshot mode. Keeps ~47% context visible and stays within partial scroll threshold (< 444px shift area)
 
 ### Mode Switching
 - Server sends `MSG_MODE_SWITCH` to tell client which mode to use

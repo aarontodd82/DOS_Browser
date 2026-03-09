@@ -421,11 +421,12 @@ static int run_browser(Config *cfg, VideoConfig *vc, net_context_t *passed_ctx)
                             handled = 1;
                             break;
                         case 0x49: /* Page Up */
-                            native_scroll(&native, -(int32_t)native.viewport_h);
+                            /* 5 lines × 48px = 240px, matches screenshot mode */
+                            native_scroll(&native, -(5 * 48));
                             handled = 1;
                             break;
                         case 0x51: /* Page Down */
-                            native_scroll(&native, (int32_t)native.viewport_h);
+                            native_scroll(&native, (5 * 48));
                             handled = 1;
                             break;
                         case 0x47: /* Home */
