@@ -21,8 +21,8 @@ static uint8_t tile_temp[TILE_PIXELS];
 
 /* RLE decode compressed data into output buffer.
  * Returns number of bytes written to output. */
-static int rle_decode(const uint8_t *src, uint16_t comp_size,
-                      uint8_t *dst, int max_out)
+int rle_decode(const uint8_t *src, uint16_t comp_size,
+               uint8_t *dst, int max_out)
 {
     const uint8_t *end = src + comp_size;
     uint8_t *dst_start = dst;

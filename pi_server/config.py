@@ -12,6 +12,13 @@ DEFAULT_CONFIG = {
     'frame_check_interval_ms': 50,
     'interaction_scan_interval_ms': 500,
     'status_update_interval_ms': 2000,
+    # YouTube mode settings
+    'youtube_fps': 10,
+    'youtube_width': 320,
+    'youtube_height': 200,
+    'yt_dlp_path': 'yt-dlp',
+    'ffmpeg_path': 'ffmpeg',
+
     'chromium_args': [
         '--disable-gpu',
         '--no-sandbox',

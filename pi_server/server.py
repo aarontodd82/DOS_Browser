@@ -27,15 +27,18 @@ from protocol import (
     MSG_INTERACTION_MAP, MSG_STATUS, MSG_KEEPALIVE_ACK,
     MSG_NATIVE_CONTENT, MSG_NATIVE_IMAGE, MSG_MODE_SWITCH, MSG_NATIVE_CLICK,
     MSG_GLYPH_CACHE,
+    MSG_YT_START, MSG_YT_FRAME, MSG_YT_EOF, MSG_YT_CONTROL, MSG_YT_ACK,
+    YT_ACTION_PAUSE, YT_ACTION_RESUME, YT_ACTION_STOP,
     NAV_BACK, NAV_FORWARD, NAV_RELOAD, NAV_STOP, NAV_TOGGLE_MODE,
     MOUSE_MOVE, MOUSE_CLICK, MOUSE_RELEASE, MOUSE_DBLCLICK,
     FLAG_CONTINUED,
     decode_header, decode_client_hello, decode_mouse_event,
     decode_key_event, decode_scroll_event, decode_text_input,
     decode_navigate, decode_nav_action, decode_native_click,
+    decode_yt_control, decode_yt_ack,
     encode_message, encode_server_hello, encode_palette,
     encode_frame_delta, encode_interaction_map, encode_status,
-    encode_mode_switch,
+    encode_mode_switch, encode_yt_start, encode_yt_frame_chunk,
     SequenceCounter, split_large_payload,
 )
 
@@ -201,6 +204,10 @@ class RetroSurfServer:
             frame_ack_event = asyncio.Event()
             frame_ack_event.set()
 
+            # YouTube mode state (shared between receive_loop and youtube_loop)
+            session.yt_state = {}
+            session.yt_ack_event = asyncio.Event()
+
             # Scroll coalescing: buffer rapid scroll events and execute
             # them as one combined scroll before the next frame capture
             scroll_accum = {'dy_pixels': 0, 'last_time': 0}
@@ -254,6 +261,22 @@ class RetroSurfServer:
                 await writer.wait_closed()
             except Exception:
                 pass
+
+            # Clean up YouTube if active
+            if session and hasattr(session, 'yt_state'):
+                yt_task = session.yt_state.get('task')
+                if yt_task and not yt_task.done():
+                    yt_task.cancel()
+                    try:
+                        await yt_task
+                    except (asyncio.CancelledError, Exception):
+                        pass
+                yt_handler = session.yt_state.get('handler')
+                if yt_handler:
+                    try:
+                        await yt_handler.stop()
+                    except Exception:
+                        pass
 
             # Close session to free browser resources immediately
             if session and session.session_id in self.sessions:
@@ -343,6 +366,12 @@ class RetroSurfServer:
                         last_status_time = now
 
                     await asyncio.sleep(0.01)  # 10ms poll
+
+            # YOUTUBE MODE: idle completely, youtube_loop handles streaming
+            if session.render_mode == 'youtube':
+                frame_ack_event.set()
+                await asyncio.sleep(0.1)
+                continue
 
             # NATIVE MODE: skip screenshot capture entirely.
             # Content is static until next navigation.
@@ -512,17 +541,24 @@ class RetroSurfServer:
             elif msg_type == MSG_NAVIGATE:
                 url = decode_navigate(payload)
                 print(f"[Server] Navigate to: {url}")
-                await session.navigate(url)
 
-                # Send status update immediately
-                status_text = await session.get_status_text()
-                await self._send_message(writer, MSG_STATUS,
-                                         encode_status(status_text), seq)
+                # Check if this is a YouTube URL
+                from youtube_handler import is_youtube_url
+                if is_youtube_url(url):
+                    await self._start_youtube(
+                        writer, session, seq, url)
+                else:
+                    await session.navigate(url)
 
-                # Check complexity for new page
-                await asyncio.sleep(0.3)  # let page settle
-                await self._check_and_send_native(
-                    writer, session, seq)
+                    # Send status update immediately
+                    status_text = await session.get_status_text()
+                    await self._send_message(writer, MSG_STATUS,
+                                             encode_status(status_text), seq)
+
+                    # Check complexity for new page
+                    await asyncio.sleep(0.3)  # let page settle
+                    await self._check_and_send_native(
+                        writer, session, seq)
 
             elif msg_type == MSG_NAV_ACTION:
                 action = decode_nav_action(payload)
@@ -580,6 +616,23 @@ class RetroSurfServer:
                         writer, session, seq)
                 else:
                     print(f"[Server] Native click: link {link_id} not found")
+
+            elif msg_type == MSG_YT_CONTROL:
+                if session.render_mode == 'youtube':
+                    ctrl = decode_yt_control(payload)
+                    action = ctrl['action']
+                    if action == YT_ACTION_STOP:
+                        await self._stop_youtube(
+                            writer, session, seq)
+                    elif action == YT_ACTION_PAUSE:
+                        session.yt_state['paused'] = True
+                        print("[YouTube] Paused")
+                    elif action == YT_ACTION_RESUME:
+                        session.yt_state['paused'] = False
+                        print("[YouTube] Resumed")
+
+            elif msg_type == MSG_YT_ACK:
+                session.yt_ack_event.set()
 
             elif msg_type == MSG_KEEPALIVE:
                 await self._send_message(writer, MSG_KEEPALIVE_ACK, b'', seq)
@@ -798,6 +851,226 @@ class RetroSurfServer:
             return False
 
         return True
+
+    async def _start_youtube(self, writer, session, seq, url):
+        """Start YouTube video playback mode."""
+        from youtube_handler import YouTubeHandler
+        from video_pipeline import VideoPipeline
+
+        await self._send_message(writer, MSG_STATUS,
+                                 encode_status("Loading YouTube..."), seq)
+
+        try:
+            handler = YouTubeHandler(self.config)
+            await handler.extract_info(url)
+        except Exception as e:
+            print(f"[YouTube] Info extraction failed: {e}")
+            await self._send_message(writer, MSG_STATUS,
+                                     encode_status(f"YouTube error: {str(e)[:60]}"), seq)
+            return
+
+        # Switch client to YouTube mode
+        await self._send_message(writer, MSG_MODE_SWITCH,
+                                 encode_mode_switch(2), seq)
+
+        try:
+            await handler.start_video()
+        except Exception as e:
+            print(f"[YouTube] ffmpeg start failed: {e}")
+            await self._send_message(writer, MSG_MODE_SWITCH,
+                                     encode_mode_switch(0), seq)
+            await self._send_message(writer, MSG_STATUS,
+                                     encode_status(f"ffmpeg error: {str(e)[:60]}"), seq)
+            await handler.stop()
+            return
+
+        # Create video pipeline (reuse palette/LUT from screenshot pipeline)
+        pipeline = VideoPipeline(handler.width, handler.height,
+                                 session.pipeline.palette,
+                                 session.pipeline.lut)
+
+        # Send YT_START
+        yt_start = encode_yt_start(handler.width, handler.height,
+                                   handler.fps, 0, 0,
+                                   handler.duration, handler.title)
+        await self._send_message(writer, MSG_YT_START, yt_start, seq)
+
+        # Enter YouTube mode
+        session.render_mode = 'youtube'
+        session.yt_state['handler'] = handler
+        session.yt_state['pipeline'] = pipeline
+        session.yt_state['paused'] = False
+        session.yt_state['stopping'] = False
+        session.yt_ack_event.set()  # allow first frame
+
+        session.yt_state['task'] = asyncio.create_task(
+            self._youtube_loop(writer, session, seq))
+
+        print(f"[YouTube] Started: {handler.title} ({handler.duration}s)")
+
+    async def _stop_youtube(self, writer, session, seq):
+        """Stop YouTube playback and return to screenshot mode."""
+        yt_state = session.yt_state
+        yt_state['stopping'] = True
+
+        # Kill ffmpeg FIRST — closes the pipe, unblocks read_video_frame
+        handler = yt_state.get('handler')
+        if handler and handler._video_proc:
+            if handler._video_proc.returncode is None:
+                try:
+                    handler._video_proc.kill()
+                except Exception:
+                    pass
+
+        # Cancel youtube loop and wait for it to finish writing.
+        # MUST wait — otherwise it keeps writing to TCP and corrupts
+        # the stream. But use a timeout so we can't hang forever.
+        task = yt_state.get('task')
+        if task and not task.done():
+            task.cancel()
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(task), timeout=3.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError,
+                    Exception):
+                pass
+
+        # Clean up handler
+        if handler:
+            handler._video_proc = None
+
+        # Switch to screenshot mode
+        session.render_mode = 'screenshot'
+        if session.pipeline:
+            session.pipeline.prev_indexed = None
+        session._dirty = True
+        await self._send_message(writer, MSG_MODE_SWITCH,
+                                 encode_mode_switch(0), seq)
+        print("[YouTube] Stopped, back to screenshot mode")
+
+    async def _youtube_loop(self, writer, session, seq):
+        """Stream video frames from ffmpeg to the DOS client."""
+        yt_state = session.yt_state
+        yt_ack_event = session.yt_ack_event
+        handler = yt_state['handler']
+        pipeline = yt_state['pipeline']
+
+        frame_num = 0
+        start_time = time.monotonic()
+        frames_sent = 0
+
+        try:
+            while handler.is_running() and not yt_state.get('stopping'):
+                # Wait for ACK from client
+                try:
+                    await asyncio.wait_for(yt_ack_event.wait(), timeout=5.0)
+                except asyncio.TimeoutError:
+                    print("[YouTube] ACK timeout, continuing")
+                yt_ack_event.clear()
+
+                # Handle pause
+                while yt_state.get('paused') and not yt_state.get('stopping'):
+                    await asyncio.sleep(0.1)
+                    start_time += 0.1  # adjust timing for pause
+
+                if yt_state.get('stopping'):
+                    break
+
+                # Read next frame from ffmpeg
+                rgb_data = await handler.read_video_frame()
+                if rgb_data is None:
+                    # Video ended
+                    await self._send_message(writer, MSG_YT_EOF, b'', seq)
+                    print(f"[YouTube] EOF after {frames_sent} frames")
+                    break
+
+                # Process through dither pipeline
+                blocks = pipeline.process_frame(rgb_data)
+
+                # Encode and send frame
+                timestamp_ms = int(frame_num * 1000 / handler.fps)
+                await self._send_yt_frame(writer, seq, frame_num,
+                                          timestamp_ms, blocks)
+
+                frame_num += 1
+                frames_sent += 1
+
+                if frames_sent % 100 == 0:
+                    elapsed = time.monotonic() - start_time
+                    actual_fps = frames_sent / elapsed if elapsed > 0 else 0
+                    print(f"[YouTube] {frames_sent} frames, "
+                          f"{actual_fps:.1f} FPS actual")
+
+                # Pace to target FPS (don't send faster than real-time)
+                target_time = start_time + frame_num / handler.fps
+                now = time.monotonic()
+                if target_time > now:
+                    await asyncio.sleep(target_time - now)
+
+        except (ConnectionError, OSError):
+            print("[YouTube] Client disconnected during playback")
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            print(f"[YouTube] Error: {e}")
+            import traceback
+            traceback.print_exc()
+        finally:
+            # Natural exit (EOF) — switch back to screenshot mode
+            if not yt_state.get('stopping'):
+                try:
+                    await handler.stop()
+                except Exception:
+                    pass
+                try:
+                    session.render_mode = 'screenshot'
+                    if session.pipeline:
+                        session.pipeline.prev_indexed = None
+                    session._dirty = True
+                    await self._send_message(writer, MSG_MODE_SWITCH,
+                                             encode_mode_switch(0), seq)
+                    print("[YouTube] Ended, back to screenshot mode")
+                except (ConnectionError, OSError):
+                    pass
+
+    async def _send_yt_frame(self, writer, seq, frame_num,
+                              timestamp_ms, blocks):
+        """Send a YouTube frame, splitting across messages if needed."""
+        MAX_CHUNK = 58000
+        BLOCK_OVERHEAD = 4  # bx(1) + by(1) + comp_size(2)
+        HEADER_OVERHEAD = 10  # frame_num(4) + timestamp_ms(4) + block_count(2)
+
+        if not blocks:
+            # Empty frame (no changes) — still send so client can ACK
+            payload = struct.pack('<IIH', frame_num, timestamp_ms, 0)
+            await self._send_message(writer, MSG_YT_FRAME, payload, seq)
+            return
+
+        # Split blocks into chunks that fit in max payload
+        chunks = []
+        current_blocks = []
+        current_size = HEADER_OVERHEAD
+
+        for bx, by, rle_data in blocks:
+            entry_size = BLOCK_OVERHEAD + len(rle_data)
+            if current_size + entry_size > MAX_CHUNK and current_blocks:
+                chunks.append(current_blocks)
+                current_blocks = []
+                current_size = HEADER_OVERHEAD
+            current_blocks.append((bx, by, rle_data))
+            current_size += entry_size
+
+        if current_blocks:
+            chunks.append(current_blocks)
+
+        for i, chunk_blocks in enumerate(chunks):
+            is_last = (i == len(chunks) - 1)
+            payload = encode_yt_frame_chunk(frame_num, timestamp_ms,
+                                            chunk_blocks)
+            flags = 0 if is_last else FLAG_CONTINUED
+            msg = encode_message(MSG_YT_FRAME, payload, seq.next(), flags)
+            writer.write(msg)
+            await writer.drain()
 
     async def _send_tiles(self, writer, tiles, seq, full=False, scroll_dy=0):
         """Send tile data, splitting into multiple messages if needed.

@@ -33,4 +33,10 @@ void render_apply_frame(RenderContext *rc, VideoConfig *vc,
 /* Free render context resources. */
 void render_shutdown(RenderContext *rc);
 
+/* RLE decode compressed data into output buffer.
+ * Shared with youtube.c for block decompression.
+ * Returns number of bytes written to output. */
+int rle_decode(const uint8_t *src, uint16_t comp_size,
+               uint8_t *dst, int max_out);
+
 #endif /* RETROSURF_RENDER_H */

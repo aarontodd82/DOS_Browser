@@ -550,6 +550,35 @@ void video_shift_content(VideoConfig *vc, int16_t dy, uint8_t fill_color)
     }
 }
 
+void video_set_mode_13h(void)
+{
+    __dpmi_regs r;
+    memset(&r, 0, sizeof(r));
+    r.x.ax = 0x0013;  /* VGA mode 13h: 320x200x256, linear at A000:0000 */
+    __dpmi_int(0x10, &r);
+    current_bank = -1;
+}
+
+void video_restore_vesa(VideoConfig *vc)
+{
+    if (vc->vesa_mode) {
+        /* Re-set the VESA mode (LFB mapping persists through DPMI) */
+        vbe_set_mode(vc->vesa_mode, vc->has_lfb);
+    } else {
+        /* VGA 12h fallback (640x480x16) */
+        __dpmi_regs r;
+        memset(&r, 0, sizeof(r));
+        r.x.ax = 0x0012;
+        __dpmi_int(0x10, &r);
+    }
+    current_bank = -1;
+
+    /* Flush backbuffer to VGA so screen isn't blank */
+    if (vc->backbuffer) {
+        video_flush_full(vc);
+    }
+}
+
 void video_shutdown(VideoConfig *vc)
 {
     __dpmi_regs r;

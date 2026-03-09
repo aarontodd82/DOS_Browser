@@ -167,6 +167,35 @@ and mirrored in `dos_client/src/protocol.h` (C, the client version).
 - FRAME_FULL and FRAME_DELTA are handled identically by the client (both are raw tiles)
 - Large frames split with FLAG_CONTINUED; ACK sent after last chunk
 - header.reserved carries scroll_dy for scroll optimization
+- YouTube messages: YT_START(0x90), YT_FRAME(0x91), YT_AUDIO(0x92), YT_EOF(0x93), YT_CONTROL(0x17), YT_ACK(0xF2)
+
+## YouTube Mode
+
+### Architecture
+When the user navigates to a YouTube URL, the server intercepts it (does NOT load in Playwright).
+Instead: yt-dlp extracts the stream URL → ffmpeg decodes/scales to 320x200 RGB24 → server dithers
+to 6x6x6 palette → 8x8 block-delta detection → RLE compression → streamed as MSG_YT_FRAME.
+
+### Key Files
+- `pi_server/youtube_handler.py` — yt-dlp info extraction, ffmpeg subprocess management
+- `pi_server/video_pipeline.py` — Bayer dither, palette quantize, 8x8 block delta, RLE compress
+- `dos_client/src/youtube.h/c` — Mode 13h setup, block blit, YouTube receive/render loop
+
+### Protocol
+- `MSG_MODE_SWITCH(2)` — Server→Client: enter YouTube mode
+- `MSG_YT_START(0x90)` — video_w(u16) video_h(u16) fps(u8) audio_rate(u16) audio_bits(u8) duration_sec(u32) title_len(u16) title
+- `MSG_YT_FRAME(0x91)` — frame_num(u32) timestamp_ms(u32) block_count(u16) [bx(u8) by(u8) comp_size(u16) rle_data]...
+- `MSG_YT_EOF(0x93)` — video ended
+- `MSG_YT_CONTROL(0x17)` — action(u8): 0=pause 1=resume 2=seek_fwd 3=seek_back 4=stop
+- `MSG_YT_ACK(0xF2)` — audio_buffer_ms(u16) (Phase 1: always 0)
+
+### Display
+Mode 13h: 320x200x256, linear framebuffer at A000:0000. No backbuffer needed for VGA —
+we keep a 64KB software framebuffer for block accumulation, then dosmemput to VGA after each frame.
+
+### Server Dependencies
+- `yt-dlp` — installed in venv via pip
+- `ffmpeg` — system install, must be in PATH
 
 ## What's Complete
 
@@ -184,6 +213,7 @@ and mirrored in `dos_client/src/protocol.h` (C, the client version).
 - **Native Rendering v3.2**: Text width scaling (Chrome-matched proportional spacing), non-ASCII transliteration, form element rendering (INPUT/TEXTAREA/SELECT/BUTTON), expanded background/border extraction, form click → screenshot mode auto-switch
 - **Scroll Optimization**: Backbuffer shift + partial strip redraw for native mode (arrow key scroll redraws ~14 rows instead of full 440-row viewport)
 - **Scrollbar**: Windows 3.1 style 16px vertical scrollbar with proportional thumb, up/down arrows, track page-up/down. Works in both screenshot and native modes. Click arrows = 1-line scroll, click track = page scroll.
+- **YouTube Mode Phase 1**: Silent video playback. Server intercepts YouTube URLs, uses yt-dlp + ffmpeg to extract/transcode video to 320x200@10fps, dithers to 256-color palette, streams block-delta RLE frames. DOS client switches to Mode 13h for fast VGA writes. Space=pause, ESC=exit.
 
 ## What's Next
 
@@ -196,7 +226,9 @@ and mirrored in `dos_client/src/protocol.h` (C, the client version).
 - **File uploads** - DOS file -> server -> browser upload dialog
 - **File downloads** - Browser download -> server -> DOS file
 - **Right-click context menus** - Send right-click to server, render result
-- **YouTube mode** - Low-res video/audio streaming to DOS (Sound Blaster audio)
+- **YouTube mode Phase 2** - Sound Blaster audio (8-bit mono 11kHz DMA playback)
+- **YouTube mode Phase 3** - Player UI (progress bar, seek, time display)
+- **YouTube mode Phase 4** - Auto-detect YouTube URLs, seamless browsing integration
 
 ### Medium Priority
 - **Multiple tabs** - Tab bar UI, memory management

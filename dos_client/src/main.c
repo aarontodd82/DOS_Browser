@@ -28,6 +28,7 @@
 #include "interact.h"
 #include "native.h"
 #include "scrollbar.h"
+#include "youtube.h"
 
 #define TILE_SIZE 16
 
@@ -349,7 +350,10 @@ static int run_browser(Config *cfg, VideoConfig *vc, net_context_t *passed_ctx)
             case MSG_MODE_SWITCH:
                 if (payload_len >= 1) {
                     int new_mode = payload_buf[0];
-                    if (new_mode == 1) {
+                    if (new_mode == 2) {
+                        /* YouTube mode - enter video player */
+                        render_mode = 2;
+                    } else if (new_mode == 1) {
                         /* Switch to native mode (always reset) */
                         render_mode = 1;
                         native_reset(&native);
@@ -404,6 +408,33 @@ static int run_browser(Config *cfg, VideoConfig *vc, net_context_t *passed_ctx)
                 break;
             }
         }
+        }
+
+        /* YouTube mode: enter video player, blocking until it returns */
+        if (render_mode == 2) {
+            int yt_rc;
+            cursor_restore(&cursor, vc->backbuffer, vc->width,
+                           vc->width, vc->height);
+            yt_rc = run_youtube(cfg, vc, &ctx, payload_buf);
+            render_mode = 0;
+            if (yt_rc == 1) { quit = 1; disconnected = 1; break; }
+            /* Re-initialize mouse for VESA resolution (Mode 13h was 320x200) */
+            input_init_mouse(vc->width, vc->height);
+            /* Restore browser chrome.
+             * NOTE: do NOT call set_startup_palette() here — yt_set_palette()
+             * already set the complete 256-entry palette. set_startup_palette()
+             * is missing indices 240-255 which causes black dots on whites. */
+            chrome_draw(&chrome, vc);
+            video_fill_rect(vc, 0, vc->chrome_height,
+                            vc->content_width, vc->content_height, 0);
+            scrollbar_draw(&scrollbar, vc);
+            chrome_set_status(&chrome, "Loading...");
+            chrome_draw_status(&chrome, vc);
+            video_flush_full(vc);
+            /* Force server to send a fresh frame by reloading the page.
+             * The push_loop may be stuck in idle after YouTube mode. */
+            send_nav_action(&ctx, NAV_RELOAD);
+            continue;  /* restart main loop */
         }
 
         /* Send FRAME_ACK immediately after receiving — BEFORE VGA flush.

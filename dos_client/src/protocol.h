@@ -51,6 +51,25 @@
 #define MSG_GLYPH_CACHE     0x8C
 #define MSG_KEEPALIVE_ACK   0xF1
 
+/* --- YouTube Mode Message Types --- */
+/* Client -> Server */
+#define MSG_YT_CONTROL    0x17
+#define MSG_YT_ACK        0xF2
+
+/* Server -> Client */
+#define MSG_YT_START        0x90
+#define MSG_YT_FRAME        0x91
+#define MSG_YT_AUDIO        0x92   /* Phase 2 */
+#define MSG_YT_EOF          0x93
+#define MSG_YT_SEEK_RESULT  0x94   /* Phase 3 */
+
+/* YouTube control actions */
+#define YT_ACTION_PAUSE     0
+#define YT_ACTION_RESUME    1
+#define YT_ACTION_SEEK_FWD  2
+#define YT_ACTION_SEEK_BACK 3
+#define YT_ACTION_STOP      4
+
 /* --- Nav Actions --- */
 #define NAV_BACK         0
 #define NAV_FORWARD      1
@@ -146,6 +165,26 @@ typedef struct {
     uint16_t comp_size;
     /* followed by comp_size bytes of compressed tile data */
 } tile_entry_t;
+
+/* YouTube start info (14 bytes + title) */
+typedef struct {
+    uint16_t video_w;
+    uint16_t video_h;
+    uint8_t  fps;
+    uint16_t audio_rate;
+    uint8_t  audio_bits;
+    uint32_t duration_sec;
+    uint16_t title_len;
+    /* followed by title_len bytes of UTF-8 title */
+} yt_start_t;
+
+/* YouTube frame chunk header (10 bytes + block entries) */
+typedef struct {
+    uint32_t frame_num;
+    uint32_t timestamp_ms;
+    uint16_t block_count;
+    /* followed by block entries: bx(u8) by(u8) comp_size(u16) rle_data */
+} yt_frame_header_t;
 
 /* Interaction map element */
 typedef struct {

@@ -72,6 +72,14 @@ void video_fill_rect(VideoConfig *vc, uint16_t x, uint16_t y,
  * Positive dy = content moves up (scroll down). Fills gap with fill_color. */
 void video_shift_content(VideoConfig *vc, int16_t dy, uint8_t fill_color);
 
+/* Switch to VGA Mode 13h (320x200x256). Does not touch VideoConfig.
+ * Used by YouTube mode for fast direct framebuffer writes. */
+void video_set_mode_13h(void);
+
+/* Restore the VESA mode saved in VideoConfig (after Mode 13h).
+ * Re-sets the VBE mode and flushes backbuffer to VGA. */
+void video_restore_vesa(VideoConfig *vc);
+
 /* Restore text mode and free resources. */
 void video_shutdown(VideoConfig *vc);
 

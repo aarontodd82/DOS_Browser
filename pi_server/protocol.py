@@ -52,6 +52,25 @@ MSG_NATIVE_IMAGE = 0x8A
 MSG_MODE_SWITCH = 0x8B
 MSG_GLYPH_CACHE = 0x8C
 
+# --- YouTube Mode Message Types ---
+# Client -> Server
+MSG_YT_CONTROL = 0x17
+MSG_YT_ACK = 0xF2
+
+# Server -> Client
+MSG_YT_START = 0x90
+MSG_YT_FRAME = 0x91
+MSG_YT_AUDIO = 0x92   # Phase 2
+MSG_YT_EOF = 0x93
+MSG_YT_SEEK_RESULT = 0x94  # Phase 3
+
+# YouTube control actions
+YT_ACTION_PAUSE = 0
+YT_ACTION_RESUME = 1
+YT_ACTION_SEEK_FWD = 2
+YT_ACTION_SEEK_BACK = 3
+YT_ACTION_STOP = 4
+
 # --- Nav Actions ---
 NAV_BACK = 0
 NAV_FORWARD = 1
@@ -474,6 +493,62 @@ def encode_glyph_cache(variants):
                                      g['bmp_yoff']))
             parts.append(g['bitmap'])
     return b''.join(parts)
+
+
+# --- YouTube Payloads ---
+
+def encode_yt_start(video_w, video_h, fps, audio_rate, audio_bits,
+                    duration_sec, title):
+    """Encode MSG_YT_START payload.
+
+    Args:
+        video_w, video_h: video dimensions (320x200)
+        fps: target frame rate
+        audio_rate: audio sample rate (0 for silent)
+        audio_bits: audio bit depth (0 for silent)
+        duration_sec: video duration in seconds
+        title: video title string (max 79 chars)
+
+    Returns:
+        bytes payload (14 + title_len bytes)
+    """
+    title_bytes = title.encode('utf-8')[:79]
+    return struct.pack('<HHBHBIH',
+                       video_w, video_h, fps,
+                       audio_rate, audio_bits,
+                       duration_sec, len(title_bytes)) + title_bytes
+
+
+def encode_yt_frame_chunk(frame_num, timestamp_ms, blocks):
+    """Encode a YouTube frame chunk payload.
+
+    Each chunk is self-contained with its own block_count.
+    Multiple chunks form a complete frame via FLAG_CONTINUED.
+
+    Args:
+        frame_num: frame sequence number
+        timestamp_ms: playback timestamp in milliseconds
+        blocks: list of (bx, by, rle_bytes) tuples
+
+    Returns:
+        bytes payload
+    """
+    parts = [struct.pack('<IIH', frame_num, timestamp_ms, len(blocks))]
+    for bx, by, rle_data in blocks:
+        parts.append(struct.pack('<BBH', bx, by, len(rle_data)))
+        parts.append(rle_data)
+    return b''.join(parts)
+
+
+def decode_yt_control(data):
+    """Decode MSG_YT_CONTROL payload."""
+    return {'action': data[0]}
+
+
+def decode_yt_ack(data):
+    """Decode MSG_YT_ACK payload."""
+    audio_buffer_ms = struct.unpack('<H', data[:2])[0]
+    return {'audio_buffer_ms': audio_buffer_ms}
 
 
 def decode_native_click(data):
