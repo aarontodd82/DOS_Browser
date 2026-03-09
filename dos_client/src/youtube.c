@@ -48,6 +48,7 @@ typedef struct {
     int      sb_available;   /* Sound Blaster detected */
     int      sb_started;     /* DMA playback running */
     uint32_t audio_msgs;     /* Debug: count of audio messages received */
+    uint16_t last_frame_num; /* Last complete video frame_num (for ACK) */
 } YTContext;
 
 /* ---- Palette setup (6x6x6 cube, same as main.c) ---- */
@@ -136,12 +137,15 @@ static void yt_send_control(net_context_t *ctx, uint8_t action)
     net_send_message(ctx, MSG_YT_CONTROL, buf, 1);
 }
 
-static void yt_send_ack(net_context_t *ctx, uint16_t audio_buffer_ms)
+static void yt_send_ack(net_context_t *ctx, uint16_t audio_buffer_ms,
+                        uint16_t last_frame_num)
 {
-    uint8_t buf[2];
+    uint8_t buf[4];
     buf[0] = (uint8_t)(audio_buffer_ms & 0xFF);
     buf[1] = (uint8_t)(audio_buffer_ms >> 8);
-    net_send_message(ctx, MSG_YT_ACK, buf, 2);
+    buf[2] = (uint8_t)(last_frame_num & 0xFF);
+    buf[3] = (uint8_t)(last_frame_num >> 8);
+    net_send_message(ctx, MSG_YT_ACK, buf, 4);
 }
 
 /* ---- Frame parsing ---- */
@@ -184,9 +188,14 @@ static void yt_apply_frame_chunk(YTContext *yt, const uint8_t *payload,
     uint8_t block_temp[YT_BLOCK_PIXELS];
     int i;
 
-    /* Skip frame_num(4) + timestamp_ms(4) */
+    /* Parse frame_num(4) + timestamp_ms(4) */
     if (len < 10) return;
 
+    {
+        uint32_t fn;
+        memcpy(&fn, ptr, 4);
+        yt->last_frame_num = (uint16_t)(fn & 0xFFFF);
+    }
     memcpy(&yt->current_ms, ptr + 4, 4);  /* timestamp_ms */
     ptr += 8;
 
@@ -343,100 +352,107 @@ int run_youtube(Config *cfg, VideoConfig *vc, net_context_t *ctx,
     }
 
     yt.state = YT_STATE_PLAYING;
+    yt.last_frame_num = 0xFFFF;  /* No frame received yet */
 
     /* Clear framebuffer for first real frame */
     memset(yt.framebuf, 0, YT_FRAMEBUF_SIZE);
 
-    /* === Main YouTube playback loop === */
+    /* === Main YouTube playback loop ===
+     * Process one message at a time. Pump audio after EVERY message.
+     * Send ACK after both audio and video messages so the server
+     * gets frequent buffer-level feedback for audio-priority sending. */
     while (!quit) {
-        int frame_done = 0;
-        int recv_retries = 0;
-        int prev_recv_pos = 0;
+        int prev_recv_pos;
 
-        /* Poll network */
+        /* Poll network + pump audio */
         net_poll();
-
-        /* Pump audio from ring buffer to DMA */
         if (yt.sb_started) sb_pump();
 
-        /* Receive and process messages */
-        while (1) {
-            prev_recv_pos = ctx->recv_pos;
-            rc = net_recv_message(ctx, &header, recv_buf, &payload_len);
-            if (rc < 0) { quit = 1; disconnected = 1; break; }
-            if (rc == 0) {
-                /* No data yet - retry if mid-message */
-                if (ctx->recv_pos > 0) {
-                    if (ctx->recv_pos > prev_recv_pos)
-                        recv_retries = 0;
-                    if (recv_retries < 50) {
-                        net_poll();
-                        recv_retries++;
-                        /* Pump audio during long receives */
-                        if (yt.sb_started && (recv_retries % 5) == 0)
-                            sb_pump();
-                        continue;
-                    }
+        /* Try to receive a complete message */
+        rc = net_recv_message(ctx, &header, recv_buf, &payload_len);
+        if (rc < 0) { quit = 1; disconnected = 1; break; }
+
+        if (rc == 0) {
+            /* No complete message — retry if partial data in buffer */
+            if (ctx->recv_pos > 0) {
+                int retries = 0;
+                while (retries < 50) {
+                    net_poll();
+                    if (yt.sb_started) sb_pump();  /* ALWAYS pump */
+                    prev_recv_pos = ctx->recv_pos;
+                    rc = net_recv_message(ctx, &header, recv_buf,
+                                          &payload_len);
+                    if (rc != 0) break;
+                    if (ctx->recv_pos == prev_recv_pos)
+                        retries++;
+                    else
+                        retries = 0;
                 }
-                break;
-            }
-            recv_retries = 0;
-
-            switch (header.msg_type) {
-            case MSG_YT_FRAME:
-                yt_apply_frame_chunk(&yt, recv_buf, payload_len);
-                if (!(header.flags & FLAG_CONTINUED)) {
-                    frame_done = 1;
-                }
-                break;
-
-            case MSG_YT_AUDIO:
-                yt_handle_audio(&yt, recv_buf, payload_len);
-                break;
-
-            case MSG_YT_EOF:
-                yt.state = YT_STATE_ENDED;
-                quit = 1;
-                break;
-
-            case MSG_MODE_SWITCH:
-                if (payload_len >= 1 && recv_buf[0] != 2) {
-                    quit = 1;
-                }
-                break;
-
-            case MSG_PALETTE:
-                video_set_palette(recv_buf, payload_len / 3);
-                break;
-
-            default:
-                break;
+                if (rc < 0) { quit = 1; disconnected = 1; break; }
+                if (rc == 0) goto idle;
+            } else {
+                goto idle;
             }
         }
 
-        /* Flush frame to VGA and send ACK */
-        if (frame_done) {
-            yt_flush_frame(&yt);
+        /* Process the received message */
+        switch (header.msg_type) {
+        case MSG_YT_FRAME:
+            yt_apply_frame_chunk(&yt, recv_buf, payload_len);
+            if (!(header.flags & FLAG_CONTINUED)) {
+                /* Complete frame — flush to VGA and ACK */
+                yt_flush_frame(&yt);
+                yt_send_ack(ctx,
+                    yt.sb_available ? sb_buffer_ms() : 0,
+                    yt.last_frame_num);
+                net_poll();
+            }
+            break;
+
+        case MSG_YT_AUDIO:
+            yt_handle_audio(&yt, recv_buf, payload_len);
+            /* ACK after audio too — gives server buffer feedback */
             yt_send_ack(ctx,
-                yt.sb_available ? sb_buffer_ms() : 0);
-            net_poll();  /* push ACK out immediately */
+                yt.sb_available ? sb_buffer_ms() : 0,
+                yt.last_frame_num);
+            net_poll();
+            break;
+
+        case MSG_YT_EOF:
+            yt.state = YT_STATE_ENDED;
+            quit = 1;
+            break;
+
+        case MSG_MODE_SWITCH:
+            if (payload_len >= 1 && recv_buf[0] != 2) {
+                quit = 1;
+            }
+            break;
+
+        case MSG_PALETTE:
+            video_set_palette(recv_buf, payload_len / 3);
+            break;
+
+        default:
+            break;
         }
 
-        /* Pump audio after frame render */
+        /* Pump after every message */
         if (yt.sb_started) sb_pump();
+        continue;
 
-        /* Handle keyboard */
+    idle:
+        /* No data — handle keyboard and idle */
         {
             KeyEvent key;
             while (input_poll_key(&key)) {
                 if (key.ascii == 27) {
-                    /* ESC - stop YouTube */
                     yt_send_control(ctx, YT_ACTION_STOP);
-                    /* Drain briefly for clean shutdown */
                     {
                         clock_t drain = clock() + CLOCKS_PER_SEC;
                         while (clock() < drain) {
                             net_poll();
+                            if (yt.sb_started) sb_pump();
                             rc = net_recv_message(ctx, &header,
                                                    recv_buf, &payload_len);
                             if (rc < 0) break;
@@ -447,7 +463,6 @@ int run_youtube(Config *cfg, VideoConfig *vc, net_context_t *ctx,
                     }
                     quit = 1;
                 } else if (key.ascii == ' ') {
-                    /* Space - toggle pause */
                     if (yt.state == YT_STATE_PAUSED) {
                         yt_send_control(ctx, YT_ACTION_RESUME);
                         yt.state = YT_STATE_PLAYING;
@@ -459,14 +474,14 @@ int run_youtube(Config *cfg, VideoConfig *vc, net_context_t *ctx,
             }
         }
 
-        /* Keep TCP alive */
+        /* Pump audio + poll during idle */
+        if (yt.sb_started) sb_pump();
         net_poll();
-
-        /* Small idle delay when no data flowing */
-        if (!frame_done) {
+        {
             int i;
             for (i = 0; i < 3; i++) {
                 net_poll();
+                if (yt.sb_started) sb_pump();
                 if (net_data_ready()) break;
             }
         }

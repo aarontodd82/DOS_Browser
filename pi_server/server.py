@@ -633,6 +633,10 @@ class RetroSurfServer:
                         print("[YouTube] Resumed")
 
             elif msg_type == MSG_YT_ACK:
+                ack = decode_yt_ack(payload)
+                session.yt_state['client_audio_ms'] = ack['audio_buffer_ms']
+                session.yt_state['client_frame_num'] = ack['last_frame_num']
+                session.yt_state['last_ack_time'] = time.monotonic()
                 session.yt_ack_event.set()
 
             elif msg_type == MSG_KEEPALIVE:
@@ -906,13 +910,17 @@ class RetroSurfServer:
 
         # Enter YouTube mode
         session.render_mode = 'youtube'
-        session.yt_state['handler'] = handler
-        session.yt_state['pipeline'] = pipeline
-        session.yt_state['paused'] = False
-        session.yt_state['stopping'] = False
+        yt_state = session.yt_state
+        yt_state['handler'] = handler
+        yt_state['pipeline'] = pipeline
+        yt_state['paused'] = False
+        yt_state['stopping'] = False
+        yt_state['client_audio_ms'] = 0
+        yt_state['client_frame_num'] = 0xFFFF
+        yt_state['last_ack_time'] = time.monotonic()
         session.yt_ack_event.set()  # allow first frame
 
-        session.yt_state['task'] = asyncio.create_task(
+        yt_state['task'] = asyncio.create_task(
             self._youtube_loop(writer, session, seq))
 
         print(f"[YouTube] Started: {handler.title} ({handler.duration}s)")
@@ -924,16 +932,15 @@ class RetroSurfServer:
 
         # Kill ffmpeg FIRST — closes the pipe, unblocks read_video_frame
         handler = yt_state.get('handler')
-        if handler and handler._video_proc:
-            if handler._video_proc.returncode is None:
-                try:
-                    handler._video_proc.kill()
-                except Exception:
-                    pass
+        if handler:
+            for proc in [handler._video_proc, handler._audio_proc]:
+                if proc and proc.returncode is None:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
 
-        # Cancel youtube loop and wait for it to finish writing.
-        # MUST wait — otherwise it keeps writing to TCP and corrupts
-        # the stream. But use a timeout so we can't hang forever.
+        # Cancel youtube loop and wait for it to finish writing
         task = yt_state.get('task')
         if task and not task.done():
             task.cancel()
@@ -947,6 +954,7 @@ class RetroSurfServer:
         # Clean up handler
         if handler:
             handler._video_proc = None
+            handler._audio_proc = None
 
         # Switch to screenshot mode
         session.render_mode = 'screenshot'
@@ -958,15 +966,23 @@ class RetroSurfServer:
         print("[YouTube] Stopped, back to screenshot mode")
 
     async def _youtube_loop(self, writer, session, seq):
-        """Stream video frames and audio from ffmpeg to the DOS client."""
+        """Stream video frames and audio from ffmpeg to the DOS client.
+
+        Simple single-loop design: one audio chunk + one video frame per
+        iteration, paced to real-time FPS. Audio chunk size = audio_rate/fps
+        so audio production exactly matches DMA consumption rate.
+
+        Extra audio is sent when the client reports low buffer level.
+        """
         yt_state = session.yt_state
         yt_ack_event = session.yt_ack_event
         handler = yt_state['handler']
         pipeline = yt_state['pipeline']
         has_audio = handler.has_audio()
-        print(f"[YouTube] has_audio={has_audio}")
 
-        # Audio samples per video frame (e.g., 11025/10 = 1102)
+        # Audio chunk = exactly one frame's worth of audio samples.
+        # At 11025 Hz / 10 fps = 1102 bytes/frame = 11020 bytes/sec,
+        # which matches the DMA consumption rate almost exactly.
         audio_per_frame = (int(handler.audio_rate / handler.fps)
                            if has_audio else 0)
 
@@ -975,9 +991,9 @@ class RetroSurfServer:
         frames_sent = 0
 
         try:
-            # Pre-buffer: send 3 audio chunks before first video frame
+            # Pre-buffer: send 5 audio chunks (~500ms at 11025/10)
             if has_audio:
-                for i in range(3):
+                for i in range(5):
                     audio_data = await handler.read_audio(audio_per_frame)
                     if audio_data:
                         payload = encode_yt_audio(0, audio_data)
@@ -987,8 +1003,9 @@ class RetroSurfServer:
                         has_audio = False
                         break
                 if has_audio:
-                    print(f"[YouTube] Pre-buffered {3 * audio_per_frame} "
-                          f"audio samples")
+                    print(f"[YouTube] Pre-buffered "
+                          f"{5 * audio_per_frame} audio samples "
+                          f"(~{5 * audio_per_frame * 1000 // handler.audio_rate}ms)")
 
             while handler.is_running() and not yt_state.get('stopping'):
                 # Wait for ACK from client
@@ -1001,14 +1018,14 @@ class RetroSurfServer:
                 # Handle pause
                 while yt_state.get('paused') and not yt_state.get('stopping'):
                     await asyncio.sleep(0.1)
-                    start_time += 0.1  # adjust timing for pause
+                    start_time += 0.1
 
                 if yt_state.get('stopping'):
                     break
 
                 timestamp_ms = int(frame_num * 1000 / handler.fps)
 
-                # Send audio chunk for this frame interval (before video)
+                # Send audio chunk for this frame interval
                 if has_audio:
                     audio_data = await handler.read_audio(audio_per_frame)
                     if audio_data:
@@ -1018,10 +1035,18 @@ class RetroSurfServer:
                     else:
                         has_audio = False
 
+                    # Send extra audio if client buffer is low
+                    client_ms = yt_state.get('client_audio_ms', 500)
+                    if client_ms < 400 and has_audio:
+                        extra = await handler.read_audio(audio_per_frame)
+                        if extra:
+                            payload = encode_yt_audio(timestamp_ms, extra)
+                            await self._send_message(
+                                writer, MSG_YT_AUDIO, payload, seq)
+
                 # Read next video frame from ffmpeg
                 rgb_data = await handler.read_video_frame()
                 if rgb_data is None:
-                    # Video ended
                     await self._send_message(writer, MSG_YT_EOF, b'', seq)
                     print(f"[YouTube] EOF after {frames_sent} frames")
                     break
@@ -1039,10 +1064,12 @@ class RetroSurfServer:
                 if frames_sent % 100 == 0:
                     elapsed = time.monotonic() - start_time
                     actual_fps = frames_sent / elapsed if elapsed > 0 else 0
+                    client_ms = yt_state.get('client_audio_ms', 0)
                     print(f"[YouTube] {frames_sent} frames, "
-                          f"{actual_fps:.1f} FPS actual")
+                          f"{actual_fps:.1f} FPS, "
+                          f"audio buf {client_ms}ms")
 
-                # Pace to target FPS (don't send faster than real-time)
+                # Pace to target FPS
                 target_time = start_time + frame_num / handler.fps
                 now = time.monotonic()
                 if target_time > now:
@@ -1057,7 +1084,6 @@ class RetroSurfServer:
             import traceback
             traceback.print_exc()
         finally:
-            # Natural exit (EOF) — switch back to screenshot mode
             if not yt_state.get('stopping'):
                 try:
                     await handler.stop()

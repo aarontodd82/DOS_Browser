@@ -546,9 +546,19 @@ def decode_yt_control(data):
 
 
 def decode_yt_ack(data):
-    """Decode MSG_YT_ACK payload."""
+    """Decode MSG_YT_ACK payload (2 or 4 bytes).
+
+    Phase 1: 2 bytes (audio_buffer_ms only)
+    Phase 2+: 4 bytes (audio_buffer_ms + last_frame_num)
+    """
     audio_buffer_ms = struct.unpack('<H', data[:2])[0]
-    return {'audio_buffer_ms': audio_buffer_ms}
+    last_frame_num = 0xFFFF
+    if len(data) >= 4:
+        last_frame_num = struct.unpack('<H', data[2:4])[0]
+    return {
+        'audio_buffer_ms': audio_buffer_ms,
+        'last_frame_num': last_frame_num,
+    }
 
 
 def encode_yt_audio(timestamp_ms, samples):
