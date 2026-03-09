@@ -21,10 +21,11 @@ typedef struct {
 typedef struct {
     uint16_t width;              /* Screen width (640 or 800) */
     uint16_t height;             /* Screen height (480 or 600) */
-    uint16_t content_width;      /* = width */
+    uint16_t content_width;      /* = width - scrollbar_width (tile area) */
     uint16_t content_height;     /* = height - chrome_height - status_height */
     uint16_t chrome_height;      /* Pixels reserved for top chrome bar */
     uint16_t status_height;      /* Pixels reserved for bottom status bar */
+    uint16_t scrollbar_width;    /* Pixels reserved for scrollbar on right */
     uint8_t  bpp;                /* 8 (256 color) or 4 (16 color) */
     uint16_t bytes_per_line;     /* From VBE mode info */
     uint8_t  has_lfb;            /* 1 if linear framebuffer available */

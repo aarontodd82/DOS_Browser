@@ -27,6 +27,7 @@
 #include "chrome.h"
 #include "interact.h"
 #include "native.h"
+#include "scrollbar.h"
 
 #define TILE_SIZE 16
 
@@ -97,7 +98,7 @@ typedef struct {
 static void dialog_init(ConnectDialog *dlg, VideoConfig *vc)
 {
     uint16_t content_top = vc->chrome_height;
-    uint16_t content_h = vc->height - content_top - 12; /* minus status */
+    uint16_t content_h = vc->content_height;
 
     dlg->w = DLG_W;
     dlg->h = DLG_H;
@@ -217,6 +218,7 @@ static int run_browser(Config *cfg, VideoConfig *vc, net_context_t *passed_ctx)
     ChromeState chrome;
     InteractCtx interact;
     NativeCtx native;
+    ScrollbarState scrollbar;
     MouseState mouse;
     int rc;
     msg_header_t header;
@@ -229,6 +231,7 @@ static int run_browser(Config *cfg, VideoConfig *vc, net_context_t *passed_ctx)
     cursor_init(&cursor);
     chrome_init(&chrome, vc);
     interact_init(&interact);
+    scrollbar_init(&scrollbar, vc);
     memset(&mouse, 0, sizeof(mouse));
 
     /* Initialize native renderer */
@@ -246,9 +249,10 @@ static int run_browser(Config *cfg, VideoConfig *vc, net_context_t *passed_ctx)
     chrome_set_url(&chrome, cfg->home_url);
     chrome_set_status(&chrome, "Loading...");
     chrome_draw(&chrome, vc);
-    /* Clear content area (remove any dialog remnants) */
-    video_fill_rect(vc, 0, vc->chrome_height, vc->width,
-                    chrome.status_y - vc->chrome_height, 0);
+    /* Clear content area and draw scrollbar */
+    video_fill_rect(vc, 0, vc->chrome_height, vc->content_width,
+                    vc->content_height, 0);
+    scrollbar_draw(&scrollbar, vc);
     video_flush_full(vc);
 
     /* === Main Loop === */
@@ -300,6 +304,7 @@ static int run_browser(Config *cfg, VideoConfig *vc, net_context_t *passed_ctx)
                 /* Shift backbuffer to match server's scroll optimization */
                 if (header.reserved != 0) {
                     video_shift_content(vc, header.reserved, 0);
+                    scrollbar_draw(&scrollbar, vc);
                     vc->full_flush = 1;
                 }
                 render_apply_frame(&render, vc, payload_buf, payload_len);
@@ -332,6 +337,13 @@ static int run_browser(Config *cfg, VideoConfig *vc, net_context_t *passed_ctx)
 
             case MSG_INTERACTION_MAP:
                 interact_parse_map(&interact, payload_buf, payload_len);
+                /* Update scrollbar from interaction map scroll info */
+                if (scrollbar_update(&scrollbar,
+                                     interact.map.scroll_height,
+                                     vc->content_height,
+                                     interact.map.scroll_y)) {
+                    scrollbar_draw(&scrollbar, vc);
+                }
                 break;
 
             case MSG_MODE_SWITCH:
@@ -344,18 +356,24 @@ static int run_browser(Config *cfg, VideoConfig *vc, net_context_t *passed_ctx)
                         native.active = 1;
                         chrome_set_status(&chrome, "[N] Native mode");
                         chrome_draw_status(&chrome, vc);
+                        /* Reset scrollbar for new content */
+                        scrollbar_update(&scrollbar, 0, vc->content_height, 0);
+                        scrollbar_draw(&scrollbar, vc);
                     } else if (new_mode == 0) {
                         /* Switch to screenshot mode */
                         render_mode = 0;
                         native.active = 0;
                         /* Clear content area for clean screenshot */
                         video_fill_rect(vc, 0, vc->chrome_height,
-                                        vc->width, vc->content_height,
-                                        0);
+                                        vc->content_width,
+                                        vc->content_height, 0);
                         video_mark_dirty(vc, 0, vc->chrome_height,
-                                         vc->width, vc->content_height);
+                                         vc->content_width,
+                                         vc->content_height);
                         chrome_set_status(&chrome, "[S] Screenshot mode");
                         chrome_draw_status(&chrome, vc);
+                        scrollbar_update(&scrollbar, 0, vc->content_height, 0);
+                        scrollbar_draw(&scrollbar, vc);
                     }
                 }
                 break;
@@ -578,6 +596,56 @@ static int run_browser(Config *cfg, VideoConfig *vc, net_context_t *passed_ctx)
                     chrome_unfocus_urlbar(&chrome);
                     chrome_draw_urlbar(&chrome, vc);
                 }
+                /* Scrollbar click — handle before content */
+                if (scrollbar_contains(&scrollbar, mouse.x, mouse.y)) {
+                    int sb_hit = scrollbar_hit_test(&scrollbar,
+                                                     mouse.x, mouse.y);
+                    if (render_mode == 1) {
+                        /* Native mode: scroll locally */
+                        switch (sb_hit) {
+                        case SB_HIT_UP_ARROW:
+                            native_scroll(&native, -font_char_height(1));
+                            break;
+                        case SB_HIT_DOWN_ARROW:
+                            native_scroll(&native, font_char_height(1));
+                            break;
+                        case SB_HIT_TRACK_UP:
+                            native_scroll(&native, -(5 * 48));
+                            break;
+                        case SB_HIT_TRACK_DOWN:
+                            native_scroll(&native, (5 * 48));
+                            break;
+                        }
+                    } else {
+                        /* Screenshot mode: send scroll to server */
+                        uint8_t sbuf[4];
+                        int slen;
+                        switch (sb_hit) {
+                        case SB_HIT_UP_ARROW:
+                            slen = proto_encode_scroll_event(sbuf, 1, 1);
+                            net_send_message(&ctx, MSG_SCROLL_EVENT,
+                                             sbuf, slen);
+                            break;
+                        case SB_HIT_DOWN_ARROW:
+                            slen = proto_encode_scroll_event(sbuf, 0, 1);
+                            net_send_message(&ctx, MSG_SCROLL_EVENT,
+                                             sbuf, slen);
+                            break;
+                        case SB_HIT_TRACK_UP:
+                            slen = proto_encode_scroll_event(sbuf, 1, 5);
+                            net_send_message(&ctx, MSG_SCROLL_EVENT,
+                                             sbuf, slen);
+                            break;
+                        case SB_HIT_TRACK_DOWN:
+                            slen = proto_encode_scroll_event(sbuf, 0, 5);
+                            net_send_message(&ctx, MSG_SCROLL_EVENT,
+                                             sbuf, slen);
+                            break;
+                        }
+                    }
+                    input_mouse_event_sent(mouse.x, mouse.y);
+                    break;
+                }
                 /* Only process if actually in content area */
                 if (mouse.y > vc->chrome_height &&
                     mouse.y < chrome.status_y) {
@@ -637,7 +705,8 @@ static int run_browser(Config *cfg, VideoConfig *vc, net_context_t *passed_ctx)
             /* Screenshot mode: send mouse release and move to server */
             if (input_mouse_released(&mouse, 0)) {
                 if (mouse.y > vc->chrome_height &&
-                    mouse.y < chrome.status_y) {
+                    mouse.y < chrome.status_y &&
+                    !scrollbar_contains(&scrollbar, mouse.x, mouse.y)) {
                     uint16_t mx = mouse.x;
                     uint16_t my = mouse.y - vc->chrome_height;
                     uint8_t mbuf[6];
@@ -649,10 +718,11 @@ static int run_browser(Config *cfg, VideoConfig *vc, net_context_t *passed_ctx)
                 input_mouse_event_sent(mouse.x, mouse.y);
             }
 
-            /* 6. Throttled mouse move (content area only) */
+            /* 6. Throttled mouse move (content area only, not scrollbar) */
             if (input_should_send_mouse_move(&mouse) &&
                 mouse.y > vc->chrome_height &&
-                mouse.y < chrome.status_y) {
+                mouse.y < chrome.status_y &&
+                !scrollbar_contains(&scrollbar, mouse.x, mouse.y)) {
                 uint16_t mx = mouse.x;
                 uint16_t my = mouse.y - vc->chrome_height;
                 uint8_t mbuf[6];
@@ -669,7 +739,10 @@ static int run_browser(Config *cfg, VideoConfig *vc, net_context_t *passed_ctx)
         }
 
         /* 7b. Update cursor shape based on mode */
-        if (mouse.y > vc->chrome_height && mouse.y < chrome.status_y) {
+        if (scrollbar_contains(&scrollbar, mouse.x, mouse.y)) {
+            cursor_set_shape(&cursor, CURSOR_ARROW);
+        } else if (mouse.y > vc->chrome_height &&
+                   mouse.y < chrome.status_y) {
             if (render_mode == 1) {
                 native_update_cursor(&native, &cursor,
                                      mouse.x, mouse.y);
@@ -686,8 +759,11 @@ static int run_browser(Config *cfg, VideoConfig *vc, net_context_t *passed_ctx)
          *    so memmove doesn't bake cursor into shifted content) */
         if (render_mode == 1 && native.needs_redraw && native.hdr_parsed) {
             native_render(&native, vc);
-            /* Redraw status bar since native render covers that area */
-            chrome_draw_status(&chrome, vc);
+            /* Update scrollbar after native scroll/render */
+            if (scrollbar_update(&scrollbar, native.hdr_content_height,
+                                 vc->content_height, native.scroll_y)) {
+                scrollbar_draw(&scrollbar, vc);
+            }
         }
 
         /* 8b. Save under + draw cursor at new position */
@@ -799,8 +875,8 @@ connect:
     chrome_set_status(&boot_chrome,
                       reconnecting ? "Reconnecting..." : "Connecting...");
     chrome_draw(&boot_chrome, &vc);
-    video_fill_rect(&vc, 0, vc.chrome_height, vc.width,
-                    boot_chrome.status_y - vc.chrome_height, 0);
+    video_fill_rect(&vc, 0, vc.chrome_height, vc.content_width,
+                    vc.content_height, 0);
     video_flush_full(&vc);
 
     /* Init connection dialog */
@@ -927,7 +1003,8 @@ connect:
     {
         uint8_t hello_buf[64];
         int payload_size = proto_encode_client_hello(
-            hello_buf, vc.width, vc.height,
+            hello_buf, vc.content_width,
+            vc.content_height + vc.chrome_height,
             vc.bpp, TILE_SIZE, vc.chrome_height, 32, 0
         );
         rc = net_send_message(&ctx, MSG_CLIENT_HELLO, hello_buf, payload_size);

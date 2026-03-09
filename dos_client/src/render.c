@@ -70,11 +70,14 @@ static void blit_tile(const uint8_t *tile, VideoConfig *vc,
     int max_rows = TILE_SIZE;
     int max_cols = TILE_SIZE;
 
-    /* Clip to screen bounds */
-    if (dst_y + max_rows > vc->height)
-        max_rows = vc->height - dst_y;
-    if (dst_x + max_cols > vc->width)
-        max_cols = vc->width - dst_x;
+    /* Clip to content area bounds (not screen edge) */
+    {
+        uint16_t content_bottom = vc->chrome_height + vc->content_height;
+        if (dst_y + max_rows > content_bottom)
+            max_rows = content_bottom - dst_y;
+        if (dst_x + max_cols > vc->content_width)
+            max_cols = vc->content_width - dst_x;
+    }
 
     for (row = 0; row < max_rows; row++) {
         memcpy(vc->backbuffer + (dst_y + row) * vc->width + dst_x,

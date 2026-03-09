@@ -836,16 +836,16 @@ static void native_render_full(NativeCtx *ctx, VideoConfig *vc)
 {
     ctx->link_count = 0;
 
-    /* Clear content area to background color */
+    /* Clear content area to background color (not scrollbar) */
     video_fill_rect(vc, 0, ctx->content_top,
-                    vc->width, ctx->viewport_h, ctx->bg_color);
+                    ctx->viewport_w, ctx->viewport_h, ctx->bg_color);
 
     /* Walk entire command stream, rebuild links, draw all visible */
     native_walk_and_render(ctx, vc, 1, 0, 0);
 
     /* Mark entire content area dirty */
     video_mark_dirty(vc, 0, ctx->content_top,
-                     vc->width, ctx->viewport_h);
+                     ctx->viewport_w, ctx->viewport_h);
 }
 
 /* ------------------------------------------------------------------ */
@@ -857,9 +857,8 @@ static void native_render_scroll(NativeCtx *ctx, VideoConfig *vc, int16_t dy)
     int clip_top = (int)ctx->content_top;
     int abs_dy = (dy < 0) ? -dy : dy;
     int strip_top, strip_bottom;
-    /* The shift area excludes the status bar — status bar is drawn
-     * on top separately, so we must not memmove its pixels. */
-    int shift_bottom = (int)vc->height - (int)vc->status_height;
+    /* Shift area is exactly the content area (status bar is below) */
+    int shift_bottom = (int)ctx->content_top + (int)ctx->viewport_h;
 
     /* 1. Shift visible content area (excludes status bar) */
     video_shift_content(vc, dy, ctx->bg_color);
@@ -875,9 +874,9 @@ static void native_render_scroll(NativeCtx *ctx, VideoConfig *vc, int16_t dy)
         strip_bottom = clip_top + abs_dy;
     }
 
-    /* 3. Clear the strip to bg_color */
+    /* 3. Clear the strip to bg_color (content width only) */
     if (strip_top < strip_bottom) {
-        video_fill_rect(vc, 0, strip_top, vc->width,
+        video_fill_rect(vc, 0, strip_top, ctx->viewport_w,
                         strip_bottom - strip_top, ctx->bg_color);
     }
 
@@ -888,7 +887,7 @@ static void native_render_scroll(NativeCtx *ctx, VideoConfig *vc, int16_t dy)
 
     /* 5. Mark content area dirty for VGA flush (shifted rows changed) */
     video_mark_dirty(vc, 0, ctx->content_top,
-                     vc->width, ctx->viewport_h);
+                     ctx->viewport_w, ctx->viewport_h);
 }
 
 /* ------------------------------------------------------------------ */
@@ -915,10 +914,9 @@ void native_render(NativeCtx *ctx, VideoConfig *vc)
         int abs_dy = (dy < 0) ? -dy : dy;
         ctx->scroll_pending_dy = 0;
 
-        /* Use partial scroll if delta < visible content height
-         * (viewport minus status bar — the area we can shift) */
+        /* Use partial scroll if delta < visible content height */
         {
-        int shift_h = (int)ctx->viewport_h - (int)vc->status_height;
+        int shift_h = (int)ctx->viewport_h;
         if (shift_h > 0 && abs_dy < shift_h) {
             native_render_scroll(ctx, vc, dy);
             return;

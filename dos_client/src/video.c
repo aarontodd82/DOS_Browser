@@ -348,9 +348,10 @@ vga_fallback:
 setup_common:
     /* Calculate content area and tile grid */
     vc->chrome_height = (vc->width >= 800) ? CHROME_HEIGHT_800 : CHROME_HEIGHT_640;
-    vc->status_height = 12;
-    vc->content_width = vc->width;
-    vc->content_height = vc->height - vc->chrome_height;
+    vc->status_height = 16;
+    vc->scrollbar_width = 16;
+    vc->content_width = vc->width - vc->scrollbar_width;
+    vc->content_height = vc->height - vc->chrome_height - vc->status_height;
     vc->tile_cols = vc->content_width / TILE_SIZE;
     vc->tile_rows = (vc->content_height + TILE_SIZE - 1) / TILE_SIZE;
     vc->tile_total = vc->tile_cols * vc->tile_rows;

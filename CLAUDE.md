@@ -182,7 +182,8 @@ and mirrored in `dos_client/src/protocol.h` (C, the client version).
 - **Interaction Map**: Forwarding mode, cursor shapes (hand/I-beam), hit testing
 - **Native Rendering v3**: Server-generated glyph cache (proportional fonts), per-element backgrounds, table borders, list markers, background image tiling, image scaling, local scrolling, link navigation, auto mode switching
 - **Native Rendering v3.2**: Text width scaling (Chrome-matched proportional spacing), non-ASCII transliteration, form element rendering (INPUT/TEXTAREA/SELECT/BUTTON), expanded background/border extraction, form click → screenshot mode auto-switch
-- **Scroll Optimization**: Backbuffer shift + partial strip redraw for native mode (arrow key scroll redraws ~14 rows instead of full 456-row viewport)
+- **Scroll Optimization**: Backbuffer shift + partial strip redraw for native mode (arrow key scroll redraws ~14 rows instead of full 440-row viewport)
+- **Scrollbar**: Windows 3.1 style 16px vertical scrollbar with proportional thumb, up/down arrows, track page-up/down. Works in both screenshot and native modes. Click arrows = 1-line scroll, click track = page scroll.
 
 ## What's Next
 
@@ -225,10 +226,19 @@ The server palette is a 6x6x6 RGB color cube (indices 0-215), NOT CGA colors.
 - Indices 216-239: grayscale ramp. 240-249: web accents. 250-254: reserved chrome colors.
 - Do NOT use CGA indices (7, 8, 15) for chrome UI - they map to blues/teals in this palette.
 
-## CLIENT_HELLO Quirk
+## CLIENT_HELLO Layout
 
-The CLIENT_HELLO sends `vc->height` (480) as `screen_height` and `chrome_height` (24) as the top bar height.
-The server computes: `viewport = 480 - 24 = 456`. Do NOT change this without careful testing.
+The CLIENT_HELLO sends `content_width` (624) as `screen_width` and `content_height + chrome_height` (464)
+as `screen_height`. The server computes: `viewport = 464 - 24 = 440`. This gives the server the exact
+content area dimensions (624x440), excluding the 16px scrollbar and 16px status bar.
+
+## Screen Layout (640x480)
+
+```
+Row 0-23:    Chrome bar (24px, full width)
+Row 24-463:  Content area (440px × 624px) + Scrollbar (440px × 16px)
+Row 464-479: Status bar (16px, full width)
+```
 
 ## Forwarding Mode (not local editing)
 

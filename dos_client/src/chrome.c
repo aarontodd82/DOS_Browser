@@ -48,9 +48,9 @@ void chrome_init(ChromeState *cs, VideoConfig *vc)
 
     cs->bar_y = 0;
     cs->bar_h = vc->chrome_height;
-    /* Status bar overlays the bottom of the screen */
+    /* Status bar sits below content area, not overlapping */
     cs->status_h = vc->status_height;
-    cs->status_y = vc->height - cs->status_h;
+    cs->status_y = vc->chrome_height + vc->content_height;
 
     /* Button layout: [<] [>] [R] [X] then URL bar fills the rest */
     btn_w = font_char_width(FONT_LARGE) * BTN_LABEL_CHARS + BTN_PADDING * 2;

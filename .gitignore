@@ -17,7 +17,8 @@ pi_server/__pycache__/
 # Tools (large binaries, not source)
 tools/
 
-# DOSBox-X runtime
+# DOSBox-X runtime (paths are machine-specific)
+dos_client/dosbox-x.conf
 dos_client/dosbox-x.log
 
 # OS files
