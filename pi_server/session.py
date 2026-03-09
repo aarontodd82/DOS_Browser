@@ -12,7 +12,9 @@ from image_pipeline import ImagePipeline
 from interaction_detector import detect_interactive_elements
 from complexity_detector import detect_complexity
 from content_extractor import extract_content
-from native_encoder import build_native_payload, process_native_image
+from native_encoder import (build_native_payload, process_native_image,
+                            generate_alt_placeholder,
+                            render_glyph_cache, process_bg_tile)
 
 
 # CSS injected into every page to optimize for low-bandwidth tile streaming.
@@ -263,6 +265,8 @@ class BrowserSession:
         # Native rendering mode
         self.render_mode = 'screenshot'  # 'screenshot' or 'native'
         self.native_link_table = []  # [(link_id, href_url), ...]
+        self._native_variant_map = {}  # (size, family, bold) -> variant_id
+        self._pending_bg_tiles = []  # bg_image nodes for lazy loading
 
     async def configure_viewport(self, width, height, color_depth, tile_size):
         """Set up the browser context and page at the requested viewport size."""
@@ -796,62 +800,220 @@ class BrowserSession:
               f"reasons={result['reasons']}")
         return result
 
+    async def generate_glyph_cache(self, font_variants):
+        """Generate glyph cache for the given font variants.
+
+        Args:
+            font_variants: set of (size_px, family, bold, italic) tuples
+
+        Returns:
+            glyph_cache_payload bytes for MSG_GLYPH_CACHE
+        """
+        import time
+        t0 = time.perf_counter()
+
+        variants_list, variant_map = render_glyph_cache(font_variants)
+        self._native_variant_map = variant_map
+
+        from protocol import encode_glyph_cache
+        payload = encode_glyph_cache(variants_list)
+
+        t1 = time.perf_counter()
+        print(f"[Session {self.session_id}] Glyph cache: "
+              f"{len(variants_list)} variants, {len(payload)} bytes, "
+              f"{(t1-t0)*1000:.1f}ms")
+
+        return payload
+
     async def extract_native_content(self):
         """Extract content structure and build command stream payload.
 
-        Returns content immediately without processing images.
-        Call get_pending_native_images() afterward to lazily load images.
+        Background tiles are processed inline (small images, fast download).
+        Regular images are deferred for lazy loading.
 
         Returns:
-            content_payload bytes for MSG_NATIVE_CONTENT
+            tuple of (glyph_payload, content_payload)
         """
+        # Reset image pixel budget for new page
+        self._image_pixels_used = 0
+
         content = await extract_content(self.page, self.viewport_width)
 
-        # Build command stream payload
+        # Store page bg color as RGB for transparent image compositing
+        from native_encoder import palette_index_to_rgb
+        self._native_bg_rgb = palette_index_to_rgb(
+            content.get('bg_color', 215))
+
+        font_variants = content.get('font_variants', set())
+
+        # Generate glyph cache first (needed for variant_map)
+        glyph_payload = await self.generate_glyph_cache(font_variants)
+
+        # Process background tiles inline — they're small and critical
+        # for visual appearance.  Convert bg_image nodes to bg_tile nodes
+        # with embedded tile data.
+        bg_tiles_processed = 0
+        bg_images_found = 0
+        nodes = content.get('nodes', [])
+        for i, node in enumerate(nodes):
+            if node.get('type') != 'bg_image':
+                continue
+            bg_images_found += 1
+            if bg_tiles_processed >= 8:  # cap
+                break
+            try:
+                repeat = node.get('repeat', 'repeat')
+                bg_size = node.get('bg_size', 'auto')
+                src = node.get('src', '')
+                area_w = node.get('w', 0)
+                area_h = node.get('h', 0)
+                print(f"[Session {self.session_id}] BG image: "
+                      f"repeat={repeat}, size={bg_size}, "
+                      f"area={area_w}x{area_h}, src={src[:60]}...")
+
+                # Determine target dimensions based on background-size
+                target_w = 0  # 0 = use natural size
+                target_h = 0
+                if bg_size in ('cover', 'contain', '100%',
+                               '100% 100%', '100% auto', 'auto 100%'):
+                    # Image should fill the element — render once
+                    target_w = min(area_w, 640)
+                    target_h = min(area_h, 800)
+                    repeat = 'no-repeat'  # override — don't tile
+                elif bg_size != 'auto' and bg_size != 'auto auto':
+                    # Explicit size like "200px 100px" or "50% auto"
+                    parts = bg_size.replace(',', ' ').split()
+                    try:
+                        pw = parts[0] if parts else 'auto'
+                        ph = parts[1] if len(parts) > 1 else 'auto'
+                        if pw.endswith('px'):
+                            target_w = int(float(pw[:-2]))
+                        elif pw.endswith('%'):
+                            target_w = int(area_w * float(pw[:-1]) / 100)
+                        if ph.endswith('px'):
+                            target_h = int(float(ph[:-2]))
+                        elif ph.endswith('%'):
+                            target_h = int(area_h * float(ph[:-1]) / 100)
+                    except (ValueError, IndexError):
+                        pass
+
+                # Choose max_tile based on whether this tiles or not
+                if repeat == 'no-repeat':
+                    # Single image: allow up to element size
+                    max_t = max(target_w, target_h, 300)
+                    max_t = min(max_t, 600)
+                else:
+                    # True tiling pattern: use natural size, cap at 128
+                    max_t = 128
+
+                result = await process_bg_tile(
+                    self.page, src, max_tile=max_t,
+                    bg_rgb=self._native_bg_rgb)
+                if result:
+                    tile_w, tile_h, rle_data = result
+                    # Replace bg_image with bg_tile (has embedded data)
+                    # Use possibly-overridden repeat (cover/contain → no-repeat)
+                    nodes[i] = {
+                        'type': 'bg_tile',
+                        'x': node.get('x', 0),
+                        'y': node.get('y', 0),
+                        'w': node.get('w', 0),
+                        'h': node.get('h', 0),
+                        'tile_w': tile_w,
+                        'tile_h': tile_h,
+                        'repeat': repeat,
+                        'rle_data': rle_data,
+                    }
+                    bg_tiles_processed += 1
+            except Exception as e:
+                print(f"[Session {self.session_id}] BG tile failed: {e}")
+
+        # Build command stream payload with variant map
         payload, link_table = build_native_payload(
-            content, self.viewport_width
+            content, self._native_variant_map, self.viewport_width
         )
         self.native_link_table = link_table
 
         # Store image nodes for lazy loading
         self._pending_native_images = [
-            node for node in content.get('nodes', [])
+            node for node in nodes
             if node.get('type') == 'image'
         ]
 
         print(f"[Session {self.session_id}] Native content: "
               f"{len(payload)} bytes, {len(link_table)} links, "
-              f"{len(self._pending_native_images)} images pending")
+              f"{len(self._pending_native_images)} images, "
+              f"{bg_tiles_processed} bg tiles")
 
-        return payload
+        return glyph_payload, payload
+
+    # Image pool budget — must match NATIVE_IMAGE_POOL in native.h
+    _IMAGE_POOL_BUDGET = 512 * 1024  # 512KB
 
     async def process_next_native_image(self):
         """Process and return the next pending native image.
 
+        Tracks cumulative pixel usage to avoid overflowing the DOS
+        image pool. Reduces image dimensions as budget gets consumed.
+
         Returns:
             (image_id, payload_bytes) or None if no more images.
         """
+        if not hasattr(self, '_image_pixels_used'):
+            self._image_pixels_used = 0
+
         while self._pending_native_images:
             node = self._pending_native_images.pop(0)
+
+            remaining = self._IMAGE_POOL_BUDGET - self._image_pixels_used
+            if remaining < 1000:
+                # Pool nearly full, skip remaining images
+                print(f"[Session {self.session_id}] "
+                      f"Image pool full, skipping remaining images")
+                self._pending_native_images.clear()
+                return None
+
+            # Scale max_pixels based on remaining budget
+            # Reserve at least 20% for future images
+            pending = len(self._pending_native_images) + 1
+            per_image_budget = min(120000, remaining // max(1, pending))
+            per_image_budget = max(4000, per_image_budget)  # min 4K pixels
+
             try:
                 result = await process_native_image(
                     self.page,
                     node['src'],
                     node['image_id'],
-                    max_width=min(300, self.viewport_width - 16),
-                    max_height=200,
+                    display_width=node.get('width', 0),
+                    display_height=node.get('height', 0),
+                    max_width=self.viewport_width - 16,
+                    max_height=800,
+                    max_pixels=per_image_budget,
+                    bg_rgb=getattr(self, '_native_bg_rgb',
+                                   (255, 255, 255)),
                 )
                 if result:
                     img_id, w, h, rle_data = result
+                    self._image_pixels_used += w * h
                     from protocol import encode_native_image
                     img_payload = encode_native_image(
                         img_id, w, h, rle_data)
-                    if img_payload is not None:
+                    return (img_id, img_payload)
+                else:
+                    # Image download failed — generate placeholder
+                    alt = node.get('alt', '')
+                    result = generate_alt_placeholder(
+                        alt,
+                        node.get('width', 100),
+                        node.get('height', 20),
+                        node['image_id'])
+                    if result:
+                        img_id, w, h, rle_data = result
+                        self._image_pixels_used += w * h
+                        from protocol import encode_native_image
+                        img_payload = encode_native_image(
+                            img_id, w, h, rle_data)
                         return (img_id, img_payload)
-                    else:
-                        print(f"[Session {self.session_id}] "
-                              f"Skipping image {node['image_id']} "
-                              f"(too large)")
             except Exception as e:
                 print(f"[Session {self.session_id}] "
                       f"Image {node.get('image_id')} failed: {e}")
@@ -860,6 +1022,48 @@ class BrowserSession:
     def has_pending_native_images(self):
         """Check if there are still images to process."""
         return bool(getattr(self, '_pending_native_images', None))
+
+    async def process_next_bg_tile(self):
+        """Process and return the next pending background tile.
+
+        Returns:
+            (bg_tile_cmd_bytes,) or None if no more tiles.
+            The cmd_bytes is a complete CMD_BG_TILE command to insert
+            into the content stream (or send as a supplementary message).
+        """
+        while getattr(self, '_pending_bg_tiles', None):
+            node = self._pending_bg_tiles.pop(0)
+            try:
+                result = await process_bg_tile(
+                    self.page,
+                    node['src'],
+                    max_tile=64,
+                    bg_rgb=getattr(self, '_native_bg_rgb',
+                                   (255, 255, 255)),
+                )
+                if result:
+                    tile_w, tile_h, rle_data = result
+                    import struct
+                    # Build CMD_BG_TILE command
+                    cmd = bytearray()
+                    cmd.append(0x06)  # CMD_BG_TILE
+                    cmd.extend(struct.pack('<HHHHHH',
+                        node.get('x', 0),
+                        node.get('y', 0),
+                        node.get('w', 0),
+                        node.get('h', 0),
+                        tile_w, tile_h))
+                    cmd.extend(struct.pack('<H', len(rle_data)))
+                    cmd.extend(rle_data)
+                    return bytes(cmd)
+            except Exception as e:
+                print(f"[Session {self.session_id}] "
+                      f"BG tile failed: {e}")
+        return None
+
+    def has_pending_bg_tiles(self):
+        """Check if there are still bg tiles to process."""
+        return bool(getattr(self, '_pending_bg_tiles', None))
 
     async def close(self):
         """Clean up browser context."""

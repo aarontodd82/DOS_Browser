@@ -180,7 +180,9 @@ and mirrored in `dos_client/src/protocol.h` (C, the client version).
 - **Mouse/Cursor/Input**: INT 33h mouse, software cursor, click/scroll/keyboard events
 - **Browser Chrome**: Nav buttons, editable URL bar, status bar, correct palette colors
 - **Interaction Map**: Forwarding mode, cursor shapes (hand/I-beam), hit testing
-- **Native Rendering**: Complexity detection, content extraction, binary command stream, DOS-side text/heading/link/image/HR rendering, local scrolling, link click navigation, auto mode switching
+- **Native Rendering v3**: Server-generated glyph cache (proportional fonts), per-element backgrounds, table borders, list markers, background image tiling, image scaling, local scrolling, link navigation, auto mode switching
+- **Native Rendering v3.2**: Text width scaling (Chrome-matched proportional spacing), non-ASCII transliteration, form element rendering (INPUT/TEXTAREA/SELECT/BUTTON), expanded background/border extraction, form click → screenshot mode auto-switch
+- **Scroll Optimization**: Backbuffer shift + partial strip redraw for native mode (arrow key scroll redraws ~14 rows instead of full 456-row viewport)
 
 ## What's Next
 
@@ -315,56 +317,81 @@ For simple pages (retro/old-web sites), the server extracts the page's content s
 
 ### Key Files
 - `pi_server/complexity_detector.py` — Page scoring via JS evaluation
-- `pi_server/content_extractor.py` — JS Range API extraction, returns positioned commands with (x,y)
-- `pi_server/native_encoder.py` — Positioned commands → binary command stream + image dithering
-- `dos_client/src/native.h/c` — DOS-side display list renderer, doc-space hit testing, local scrolling
+- `pi_server/content_extractor.py` — JS extraction with backgrounds, borders, list markers, font-family
+- `pi_server/native_encoder.py` — Glyph cache generation (Pillow TTF), command stream encoding, bg tile processing
+- `dos_client/src/native.h/c` — Glyph cache parsing, proportional rendering, image scaling, display list renderer
 
-### How It Works (v2 — Pre-Positioned Display List)
-The server uses the browser's own CSS layout engine to compute exact positions:
-- **Text**: Range API + `getClientRects()` to get per-line bounding rects. Each visual line becomes one CMD_TEXT with exact (x, y) in document space.
-- **Links**: `getClientRects()` on `<a>` elements → one CMD_LINK_RECT per visual line (for hit testing, not drawing)
-- **Images**: `getBoundingClientRect()` → CMD_IMAGE with (x, y, w, h)
-- **HRs**: `getBoundingClientRect()` → CMD_RECT with fill color
+### How It Works (v3 — Proportional Fonts + Backgrounds)
 
-The DOS client is a dumb renderer — just blit at `screen_y = doc_y - scroll_y + content_top`. No word-wrap, no heading spacing, no layout logic. Scrolling is instant and local.
+**Glyph Cache (like Windows 3.1 .FON files):**
+The server analyzes font usage on the page, renders proportional glyph bitmaps using Pillow + TTF fonts
+(Arial, Times, Courier), and sends a MSG_GLYPH_CACHE before content. Each glyph has a per-character
+advance width, so text renders proportionally. Font sizes are quantized to 8 buckets
+(8,10,12,14,16,18,20,24px), with max 8 font variants per page (size × family × bold × italic).
+If glyph cache is missing, DOS falls back to BIOS ROM fonts.
+
+**Content Extraction:**
+- **Backgrounds**: Every block element with non-transparent backgroundColor → CMD_RECT (emitted before text)
+- **Table borders**: Computed CSS border on td/th/table → thin CMD_RECT lines
+- **Text**: Range API per-line positions, font field = variant_id from glyph cache
+- **List markers**: `<li>` elements → synthesized bullet/number as CMD_TEXT (decimal, alpha, roman)
+- **Images**: getBoundingClientRect for display dimensions, nearest-neighbor scaled on DOS
+- **Image transparency**: GIF89a/PNG alpha composited against white before dithering
+- **Image maps**: `<map>`/`<area>` → link_rect commands (rect, circle, poly, default)
+- **Linked image borders**: Blue 2px border on images inside `<a>` tags (Netscape-style)
+- **Alt text placeholders**: Gray box with `[alt]` text when image download fails
+- **Background images**: Tile downloaded, dithered, sent as CMD_BG_TILE
+- **HRs**: 3D embossed or flat solid rule (respects `noshade`, `color` attributes)
+- **Preformatted text**: `<pre>` whitespace preserved (no collapse)
+- **Strikethrough**: `<s>`, `<strike>`, `<del>` rendered with line through middle
+- **Fragment anchors**: `#anchor` links scroll to target element position
+- **Links**: getClientRects → CMD_LINK_RECT for hit testing
+- **Text width scaling**: Chrome's rendered text width sent with each CMD_TEXT; client scales glyph advances via 8.8 fixed-point to match exactly
+- **Non-ASCII transliteration**: é→e, ü→u, ©→(c), —→--, etc. for Latin-1/Unicode text
+- **Form elements**: INPUT/TEXTAREA/SELECT/BUTTON rendered with 3D borders and value text
+- **Form interaction**: Clicking non-link areas in native mode sends mouse event to server, which auto-switches to screenshot mode for form input
+- **Expanded backgrounds**: SPAN, CODE, KBD, MARK, BUTTON, H1-H6, form elements
+- **Expanded borders**: DIV, FIELDSET, BLOCKQUOTE, PRE, P, FORM, BUTTON, form elements
+
+Commands sorted by visual layer (painter's algorithm): bg_rect → bg_image → border → rect → image → text → link_rect.
 
 ### Protocol Messages
+- `MSG_GLYPH_CACHE (0x8C)`: Server→Client, proportional font glyph bitmaps
 - `MSG_MODE_SWITCH (0x8B)`: Server→Client, payload: mode(u8) 0=screenshot 1=native
 - `MSG_NATIVE_CONTENT (0x89)`: Server→Client, 7-byte header + command stream (uses FLAG_CONTINUED)
 - `MSG_NATIVE_IMAGE (0x8A)`: Server→Client, pre-dithered image data
 - `MSG_NATIVE_CLICK (0x16)`: Client→Server, link_id(u16)
 
-### Command Stream Format (v2)
-7-byte header: bg_color(u8) link_count(u16) image_count(u16) doc_height(u16)
+### Command Stream Format (v3)
+9-byte header: bg_color(u8) link_count(u16) image_count(u16) doc_height(u16) initial_scroll_y(u16)
 
 | Tag | Name | Data |
 |-----|------|------|
-| 0x01 | CMD_TEXT | x(u16) y(u16) color(u8) font(u8) flags(u8) len(u16) text |
+| 0x01 | CMD_TEXT | x(u16) y(u16) color(u8) font(u8=variant_id) flags(u8:bold\|italic\|underline\|strikethrough) text_width(u16) len(u16) text |
 | 0x02 | CMD_LINK_RECT | link_id(u16) x(u16) y(u16) w(u16) h(u16) |
-| 0x03 | CMD_IMAGE | image_id(u16) x(u16) y(u16) w(u16) h(u16) |
-| 0x04 | CMD_RECT | x(u16) y(u16) w(u16) h(u16) color(u8) |
+| 0x03 | CMD_IMAGE | image_id(u16) x(u16) y(u16) w(u16) h(u16) — w/h used for scaling |
+| 0x04 | CMD_RECT | x(u16) y(u16) w(u16) h(u16) color(u8) — backgrounds, borders, HRs |
+| 0x06 | CMD_BG_TILE | x(u16) y(u16) area_w(u16) area_h(u16) tile_w(u16) tile_h(u16) comp_size(u16) [rle] |
 | 0xFF | CMD_END | (none) |
 
-All coordinates are document-space (viewport-relative + scrollY), u16 (max 65535).
+### Caps & Fallbacks
+- Max 8 font variants (excess bucketed to closest match by size/family/bold distance)
+- Max 95 glyphs per variant (printable ASCII 32-126)
+- Max 64 images, 512KB image pool total
+- Max 8 bg tiles, max 64×64 per tile, 32KB tile pool
+- Glyph cache missing → BIOS ROM font fallback
+- Content buffer overflow → truncate (page too complex, should use screenshot mode)
 
-### Known Gaps (vs Netscape Navigator)
-
-**Critical:**
-1. **Fixed-width font mismatch** — Browser uses proportional fonts but DOS uses 8px fixed-width. Text starts at correct x but extends too far right, causing overflow/overlap. This is the #1 visual issue.
-2. **No per-element backgrounds** — Only page bg_color renders. Table cells, divs with colored backgrounds show as blank page color. Old sites use colored cells heavily.
-3. **No table borders** — Content positions are correct (browser-computed) but no visible cell borders.
-
-**Important:**
-4. **No list markers** — Bullet points and numbers are CSS-generated content (::marker) that Range API can't see.
-5. **Image size gap** — Server resizes images to max ~300px, but browser may display them larger, leaving empty space around smaller actual image.
-
-**Already working (thanks to pre-positioned approach):**
-- Centered/right-aligned text (browser computes x position)
-- Blockquote indentation (browser computes indented x)
-- Heading sizes and bold weight
-- Link underlines, colors, hit testing
-- HR elements as filled rects
-- Inline images at browser-computed positions
+### Scroll Optimization (native mode)
+Native mode scrolling uses backbuffer shift + partial strip redraw instead of full re-render:
+- `native_scroll()` accumulates `scroll_pending_dy` (clamped actual delta)
+- `native_render()` dispatches: if `|delta| < shift_h` → partial, else → full render
+- **Partial path**: `video_shift_content()` memmoves existing pixels, then only clears and redraws the thin exposed strip (e.g., 14 rows for arrow key vs 456 full viewport)
+- **Shift area excludes status bar** (rows 24-467, not 24-479) to prevent status bar pixels from being dragged into content
+- **Link rects preserved across scrolls** — stored in document space, scroll-invariant, not rebuilt
+- **Render before cursor draw** — native_render runs before cursor_save_and_draw to prevent mouse cursor from being baked into memmove'd content
+- **Status bar redrawn after native render** — native content area overlaps status bar region
+- Home/End/image arrival reset `scroll_pending_dy = 0` to force full render
 
 ### Mode Switching
 - Server sends `MSG_MODE_SWITCH` to tell client which mode to use
@@ -378,5 +405,7 @@ All coordinates are document-space (viewport-relative + scrollY), u16 (max 65535
 |------------|------|
 | content_buf | 200 KB |
 | image_pool | 512 KB |
-| links + images structs | ~6 KB |
-| **Total native** | **~718 KB** |
+| glyph_data_pool | 16 KB |
+| bg_tile_pool | 32 KB |
+| links + images + variant structs | ~16 KB |
+| **Total native** | **~776 KB** |

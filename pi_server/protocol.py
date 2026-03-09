@@ -50,6 +50,7 @@ MSG_NATIVE_CLICK = 0x16
 MSG_NATIVE_CONTENT = 0x89
 MSG_NATIVE_IMAGE = 0x8A
 MSG_MODE_SWITCH = 0x8B
+MSG_GLYPH_CACHE = 0x8C
 
 # --- Nav Actions ---
 NAV_BACK = 0
@@ -388,7 +389,7 @@ def encode_cursor_shape(cursor_type, hotspot_x=0, hotspot_y=0,
 # --- Native Rendering Payloads ---
 
 def encode_native_content(bg_color, link_count, image_count, content_height,
-                          command_stream):
+                          command_stream, initial_scroll_y=0):
     """Encode MSG_NATIVE_CONTENT payload.
 
     Args:
@@ -396,13 +397,14 @@ def encode_native_content(bg_color, link_count, image_count, content_height,
         link_count: number of links in the content
         image_count: number of images in the content
         content_height: total content height in pixels
+        initial_scroll_y: initial scroll offset for fragment anchors
         command_stream: binary command stream bytes
 
     Returns:
-        bytes of the complete payload (7-byte header + commands)
+        bytes of the complete payload (9-byte header + commands)
     """
-    header = struct.pack('<BHHH', bg_color, link_count, image_count,
-                         content_height)
+    header = struct.pack('<BHHHH', bg_color, link_count, image_count,
+                         content_height, initial_scroll_y)
     return header + command_stream
 
 
@@ -415,15 +417,11 @@ def encode_native_image(image_id, width, height, rle_data):
         rle_data: RLE-compressed palette-indexed pixel data
 
     Returns:
-        bytes of the complete payload, or None if too large
+        bytes of the complete payload (may need split_large_payload)
     """
     # compressed_size is u32 to handle large images
     header = struct.pack('<HHHI', image_id, width, height, len(rle_data))
-    payload = header + rle_data
-    # Must fit in a single message (payload_len is uint16)
-    if len(payload) > 60000:
-        return None
-    return payload
+    return header + rle_data
 
 
 def encode_mode_switch(mode):
@@ -436,6 +434,46 @@ def encode_mode_switch(mode):
         1-byte payload
     """
     return struct.pack('<B', mode)
+
+
+def encode_glyph_cache(variants):
+    """Encode MSG_GLYPH_CACHE payload.
+
+    Args:
+        variants: list of dicts, each with:
+            variant_id (int): 0-7
+            line_height (int): pixel height of font line
+            baseline (int): baseline offset from top
+            glyphs: list of dicts with:
+                char_code (int): ASCII code
+                advance (int): proportional advance width
+                bmp_w (int): bitmap width
+                bmp_h (int): bitmap height
+                bmp_xoff (int): x offset from cursor (signed)
+                bmp_yoff (int): y offset from top (signed)
+                bitmap (bytes): packed 1-bit data, MSB first
+
+    Returns:
+        bytes payload
+    """
+    parts = [struct.pack('<B', len(variants))]
+    for var in variants:
+        glyphs = var['glyphs']
+        parts.append(struct.pack('<BBBB',
+                                 var['variant_id'],
+                                 var['line_height'],
+                                 var['baseline'],
+                                 len(glyphs)))
+        for g in glyphs:
+            parts.append(struct.pack('<BBBBbb',
+                                     g['char_code'],
+                                     g['advance'],
+                                     g['bmp_w'],
+                                     g['bmp_h'],
+                                     g['bmp_xoff'],
+                                     g['bmp_yoff']))
+            parts.append(g['bitmap'])
+    return b''.join(parts)
 
 
 def decode_native_click(data):

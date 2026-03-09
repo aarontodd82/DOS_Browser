@@ -26,6 +26,7 @@ from protocol import (
     MSG_SERVER_HELLO, MSG_PALETTE, MSG_FRAME_FULL, MSG_FRAME_DELTA,
     MSG_INTERACTION_MAP, MSG_STATUS, MSG_KEEPALIVE_ACK,
     MSG_NATIVE_CONTENT, MSG_NATIVE_IMAGE, MSG_MODE_SWITCH, MSG_NATIVE_CLICK,
+    MSG_GLYPH_CACHE,
     NAV_BACK, NAV_FORWARD, NAV_RELOAD, NAV_STOP, NAV_TOGGLE_MODE,
     MOUSE_MOVE, MOUSE_CLICK, MOUSE_RELEASE, MOUSE_DBLCLICK,
     FLAG_CONTINUED,
@@ -403,6 +404,36 @@ class RetroSurfServer:
             msg_type = header['msg_type']
 
             if msg_type == MSG_MOUSE_EVENT:
+                # In native mode, check if the click hit a form element.
+                # Only switch to screenshot mode if it did.
+                if session.render_mode == 'native':
+                    evt = decode_mouse_event(payload)
+                    if evt['event_type'] == MOUSE_CLICK:
+                        try:
+                            is_form = await session.page.evaluate(
+                                '''([x, y]) => {
+                                    const el = document.elementFromPoint(x, y);
+                                    if (!el) return false;
+                                    const tag = el.tagName;
+                                    return tag === 'INPUT' || tag === 'TEXTAREA'
+                                        || tag === 'SELECT' || tag === 'BUTTON'
+                                        || el.isContentEditable
+                                        || !!el.closest('button, label');
+                                }''', [evt['x'], evt['y']])
+                        except Exception:
+                            is_form = False
+                        if is_form:
+                            session.render_mode = 'screenshot'
+                            if session.pipeline:
+                                session.pipeline.prev_indexed = None
+                            await self._send_message(
+                                writer, MSG_MODE_SWITCH,
+                                encode_mode_switch(0), seq)
+                            print("[Server] Form element clicked -> "
+                                  "screenshot mode")
+                            await self._handle_mouse(session, payload)
+                        # Non-form clicks in native mode: ignore
+                    continue
                 await self._handle_mouse(session, payload)
 
             elif msg_type == MSG_KEY_EVENT:
@@ -637,10 +668,34 @@ class RetroSurfServer:
         print("[Server] Switched to native mode")
 
         try:
-            # Extract and send content immediately (no image processing)
-            content_payload = await session.extract_native_content()
+            # Extract content and generate glyph cache
+            glyph_payload, content_payload = \
+                await session.extract_native_content()
 
-            # Send content first — client renders text/links instantly
+            # If extraction returned nothing useful (framesets, empty pages),
+            # fall back to screenshot mode
+            if len(content_payload) < 20:
+                print("[Server] Native extraction empty, "
+                      "falling back to screenshot mode")
+                session.render_mode = 'screenshot'
+                if session.pipeline:
+                    session.pipeline.prev_indexed = None
+                await self._send_message(
+                    writer, MSG_MODE_SWITCH,
+                    encode_mode_switch(0), seq)
+                return False
+
+            # Send glyph cache first — client needs fonts before text
+            glyph_messages = split_large_payload(
+                MSG_GLYPH_CACHE, glyph_payload, seq)
+            for msg in glyph_messages:
+                writer.write(msg)
+            await writer.drain()
+            print(f"[Server] Sent glyph cache "
+                  f"({len(glyph_payload)} bytes, "
+                  f"{len(glyph_messages)} chunks)")
+
+            # Send content — client renders text/links instantly
             messages = split_large_payload(
                 MSG_NATIVE_CONTENT, content_payload, seq)
             for msg in messages:
@@ -658,10 +713,15 @@ class RetroSurfServer:
                 result = await session.process_next_native_image()
                 if result:
                     img_id, img_payload = result
-                    await self._send_message(
-                        writer, MSG_NATIVE_IMAGE, img_payload, seq)
+                    # Split large images across multiple messages
+                    img_messages = split_large_payload(
+                        MSG_NATIVE_IMAGE, img_payload, seq)
+                    for msg in img_messages:
+                        writer.write(msg)
+                    await writer.drain()
                     print(f"[Server] Sent native image {img_id} "
-                          f"({len(img_payload)} bytes)")
+                          f"({len(img_payload)} bytes, "
+                          f"{len(img_messages)} chunks)")
 
         except Exception as e:
             print(f"[Server] Native content extraction failed: {e}")

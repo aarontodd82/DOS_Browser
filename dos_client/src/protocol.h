@@ -48,6 +48,7 @@
 #define MSG_NATIVE_CONTENT  0x89
 #define MSG_NATIVE_IMAGE    0x8A
 #define MSG_MODE_SWITCH     0x8B
+#define MSG_GLYPH_CACHE     0x8C
 #define MSG_KEEPALIVE_ACK   0xF1
 
 /* --- Nav Actions --- */

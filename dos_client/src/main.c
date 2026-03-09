@@ -343,6 +343,11 @@ static int run_browser(Config *cfg, VideoConfig *vc, net_context_t *passed_ctx)
                 }
                 break;
 
+            case MSG_GLYPH_CACHE:
+                native_parse_glyph_cache(&native, payload_buf,
+                                          payload_len, header.flags);
+                break;
+
             case MSG_NATIVE_CONTENT:
                 native_parse_content(&native, payload_buf, payload_len,
                                      header.flags);
@@ -352,8 +357,12 @@ static int run_browser(Config *cfg, VideoConfig *vc, net_context_t *passed_ctx)
                 break;
 
             case MSG_NATIVE_IMAGE:
-                native_parse_image(&native, payload_buf, payload_len);
-                native.needs_redraw = 1;  /* re-render to show image */
+                native_parse_image(&native, payload_buf, payload_len,
+                                    header.flags);
+                if (!(header.flags & FLAG_CONTINUED)) {
+                    native.scroll_pending_dy = 0;  /* force full redraw */
+                    native.needs_redraw = 1;  /* re-render to show image */
+                }
                 break;
 
             default:
@@ -421,11 +430,13 @@ static int run_browser(Config *cfg, VideoConfig *vc, net_context_t *passed_ctx)
                             break;
                         case 0x47: /* Home */
                             native.scroll_y = 0;
+                            native.scroll_pending_dy = 0;
                             native.needs_redraw = 1;
                             handled = 1;
                             break;
                         case 0x4F: /* End */
                             native.scroll_y = native.max_scroll_y;
+                            native.scroll_pending_dy = 0;
                             native.needs_redraw = 1;
                             handled = 1;
                             break;
@@ -565,6 +576,19 @@ static int run_browser(Config *cfg, VideoConfig *vc, net_context_t *passed_ctx)
                                              cbuf, clen);
                             chrome_set_status(&chrome, "Loading...");
                             chrome_draw_status(&chrome, vc);
+                        } else {
+                            /* No link hit — send click to server.
+                             * Server checks if a form element is at
+                             * these coords and only switches to
+                             * screenshot mode if so. */
+                            uint16_t mx = mouse.x;
+                            uint16_t my = mouse.y - vc->chrome_height;
+                            uint8_t mbuf[6];
+                            int mlen = proto_encode_mouse_event(
+                                mbuf, mx, my, mouse.buttons,
+                                MOUSE_CLICK);
+                            net_send_message(&ctx, MSG_MOUSE_EVENT,
+                                             mbuf, mlen);
                         }
                     } else {
                         /* Screenshot mode: use interaction map */
@@ -640,7 +664,15 @@ static int run_browser(Config *cfg, VideoConfig *vc, net_context_t *passed_ctx)
             cursor_set_shape(&cursor, CURSOR_ARROW);
         }
 
-        /* 8. Save under + draw cursor at new position */
+        /* 8. Native mode: render content if dirty (BEFORE cursor draw,
+         *    so memmove doesn't bake cursor into shifted content) */
+        if (render_mode == 1 && native.needs_redraw && native.hdr_parsed) {
+            native_render(&native, vc);
+            /* Redraw status bar since native render covers that area */
+            chrome_draw_status(&chrome, vc);
+        }
+
+        /* 8b. Save under + draw cursor at new position */
         cursor_save_and_draw(&cursor, vc->backbuffer, vc->width,
                              vc->width, vc->height,
                              mouse.x, mouse.y);
@@ -658,11 +690,6 @@ static int run_browser(Config *cfg, VideoConfig *vc, net_context_t *passed_ctx)
                                  mouse.prev_y - cursor.hotspot_y,
                                  cursor.width, cursor.height);
             }
-        }
-
-        /* 8b. Native mode: render content if dirty */
-        if (render_mode == 1 && native.needs_redraw && native.hdr_parsed) {
-            native_render(&native, vc);
         }
 
         /* 9. Pump TCP before flush to keep ACKs flowing */
