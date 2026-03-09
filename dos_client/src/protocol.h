@@ -186,6 +186,13 @@ typedef struct {
     /* followed by block entries: bx(u8) by(u8) comp_size(u16) rle_data */
 } yt_frame_header_t;
 
+/* YouTube audio chunk header (6 bytes + PCM samples) */
+typedef struct {
+    uint32_t timestamp_ms;
+    uint16_t sample_count;
+    /* followed by sample_count bytes of 8-bit unsigned mono PCM */
+} yt_audio_t;
+
 /* Interaction map element */
 typedef struct {
     uint16_t id;

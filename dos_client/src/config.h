@@ -18,6 +18,9 @@ typedef struct {
     uint16_t server_port;
     uint8_t  video_mode;        /* VIDMODE_xxx */
     char     home_url[256];
+    uint16_t sb_base;           /* Sound Blaster base port (default 0x220) */
+    uint8_t  sb_irq;            /* Sound Blaster IRQ (default 7) */
+    uint8_t  sb_dma;            /* Sound Blaster DMA channel (default 1) */
 } Config;
 
 /* Load config from file. Uses defaults if file not found.

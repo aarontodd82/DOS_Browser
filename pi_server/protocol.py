@@ -551,6 +551,19 @@ def decode_yt_ack(data):
     return {'audio_buffer_ms': audio_buffer_ms}
 
 
+def encode_yt_audio(timestamp_ms, samples):
+    """Encode MSG_YT_AUDIO payload.
+
+    Args:
+        timestamp_ms: playback timestamp in milliseconds
+        samples: bytes of 8-bit unsigned mono PCM samples
+
+    Returns:
+        bytes payload (6 + len(samples) bytes)
+    """
+    return struct.pack('<IH', timestamp_ms, len(samples)) + samples
+
+
 def decode_native_click(data):
     """Decode MSG_NATIVE_CLICK payload.
 

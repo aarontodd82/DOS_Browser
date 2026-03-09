@@ -13,6 +13,9 @@ static void config_defaults(Config *cfg)
     cfg->server_port = 8086;
     cfg->video_mode = VIDMODE_AUTO;
     strcpy(cfg->home_url, "https://www.google.com");
+    cfg->sb_base = 0x220;
+    cfg->sb_irq = 7;
+    cfg->sb_dma = 1;
 }
 
 static void trim(char *s)
@@ -57,6 +60,12 @@ int config_load(Config *cfg, const char *filename)
             else cfg->video_mode = VIDMODE_AUTO;
         } else if (strcmp(key, "home_url") == 0) {
             strncpy(cfg->home_url, val, sizeof(cfg->home_url) - 1);
+        } else if (strcmp(key, "sb_base") == 0) {
+            cfg->sb_base = (uint16_t)strtol(val, NULL, 16);
+        } else if (strcmp(key, "sb_irq") == 0) {
+            cfg->sb_irq = (uint8_t)atoi(val);
+        } else if (strcmp(key, "sb_dma") == 0) {
+            cfg->sb_dma = (uint8_t)atoi(val);
         }
     }
 

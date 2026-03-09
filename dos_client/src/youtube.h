@@ -6,7 +6,8 @@
  * for fast direct framebuffer writes, receives block-delta RLE frames,
  * and blits them to VGA.
  *
- * Phase 1: Silent video only (no audio).
+ * Phase 1: Silent video only.
+ * Phase 2: Sound Blaster audio (8-bit mono 11025 Hz DMA playback).
  */
 
 #ifndef RETROSURF_YOUTUBE_H
@@ -44,10 +45,11 @@
  * Called from main.c when MSG_MODE_SWITCH(2) is received.
  * Switches to Mode 13h, receives and displays video frames,
  * handles keyboard input (ESC to exit, Space to pause).
+ * If Sound Blaster is detected, plays audio via DMA.
  * Restores VESA mode before returning.
  *
  * Args:
- *   cfg: client configuration
+ *   cfg: client configuration (includes sb_base/irq/dma)
  *   vc: video config (VESA mode info, needed for restore)
  *   ctx: network context (for send/receive)
  *   recv_buf: shared receive buffer (MAX_PAYLOAD_SIZE bytes)

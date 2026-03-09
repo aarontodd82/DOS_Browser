@@ -2,7 +2,12 @@
  * RetroSurf YouTube Mode - Video playback in Mode 13h
  *
  * Receives block-delta RLE video frames from the server and blits
- * them directly to VGA Mode 13h (320x200x256). Phase 1: silent video.
+ * them directly to VGA Mode 13h (320x200x256).
+ *
+ * Phase 2: Sound Blaster audio via DMA double-buffering.
+ * Audio samples arrive as MSG_YT_AUDIO messages interleaved with
+ * video frames. Samples are fed into a ring buffer; DMA plays them
+ * continuously via auto-init mode.
  */
 
 #include <stdio.h>
@@ -22,18 +27,27 @@
 #include "font.h"
 #include "input.h"
 #include "render.h"  /* for rle_decode */
+#include "sbdma.h"
 
 /* YouTube context (local to this module) */
 typedef struct {
     uint8_t  state;
     uint16_t video_w, video_h;
     uint8_t  fps;
+    uint16_t audio_rate;
+    uint8_t  audio_bits;
     uint32_t duration_ms;
     uint32_t current_ms;
     char     title[80];
 
     /* Software framebuffer (320x200 in extended memory) */
     uint8_t  *framebuf;
+
+    /* Audio state */
+    int      has_audio;      /* Server indicated audio available */
+    int      sb_available;   /* Sound Blaster detected */
+    int      sb_started;     /* DMA playback running */
+    uint32_t audio_msgs;     /* Debug: count of audio messages received */
 } YTContext;
 
 /* ---- Palette setup (6x6x6 cube, same as main.c) ---- */
@@ -63,26 +77,24 @@ static void yt_set_palette(void)
         pal[i * 3 + 2] = v;
     }
 
-    /* Web UI accent colors (indices 240-249) — the server LUT maps
-     * near-white pixels to index 247 (240,240,240). Without these
-     * entries, those pixels render as BLACK. */
-    pal[240*3+0] =   0; pal[240*3+1] = 102; pal[240*3+2] = 204; /* sel blue */
-    pal[241*3+0] =   0; pal[241*3+1] =   0; pal[241*3+2] = 238; /* link blue */
-    pal[242*3+0] = 204; pal[242*3+1] =   0; pal[242*3+2] =   0; /* error red */
-    pal[243*3+0] =   0; pal[243*3+1] = 153; pal[243*3+2] =   0; /* success grn */
-    pal[244*3+0] = 255; pal[244*3+1] = 204; pal[244*3+2] =   0; /* warn yellow */
-    pal[245*3+0] = 192; pal[245*3+1] = 192; pal[245*3+2] = 192; /* border gray */
-    pal[246*3+0] = 128; pal[246*3+1] = 128; pal[246*3+2] = 128; /* shadow gray */
-    pal[247*3+0] = 240; pal[247*3+1] = 240; pal[247*3+2] = 240; /* light bg */
-    pal[248*3+0] =  51; pal[248*3+1] =  51; pal[248*3+2] =  51; /* dark text */
-    pal[249*3+0] = 255; pal[249*3+1] = 255; pal[249*3+2] = 255; /* white */
+    /* Web UI accent colors (indices 240-249) */
+    pal[240*3+0] =   0; pal[240*3+1] = 102; pal[240*3+2] = 204;
+    pal[241*3+0] =   0; pal[241*3+1] =   0; pal[241*3+2] = 238;
+    pal[242*3+0] = 204; pal[242*3+1] =   0; pal[242*3+2] =   0;
+    pal[243*3+0] =   0; pal[243*3+1] = 153; pal[243*3+2] =   0;
+    pal[244*3+0] = 255; pal[244*3+1] = 204; pal[244*3+2] =   0;
+    pal[245*3+0] = 192; pal[245*3+1] = 192; pal[245*3+2] = 192;
+    pal[246*3+0] = 128; pal[246*3+1] = 128; pal[246*3+2] = 128;
+    pal[247*3+0] = 240; pal[247*3+1] = 240; pal[247*3+2] = 240;
+    pal[248*3+0] =  51; pal[248*3+1] =  51; pal[248*3+2] =  51;
+    pal[249*3+0] = 255; pal[249*3+1] = 255; pal[249*3+2] = 255;
 
     /* DOS chrome colors (indices 250-254) */
-    pal[250*3+0] =  64; pal[250*3+1] =  64; pal[250*3+2] =  64; /* chrome bg */
-    pal[251*3+0] = 255; pal[251*3+1] = 255; pal[251*3+2] = 255; /* chrome text */
-    pal[252*3+0] = 240; pal[252*3+1] = 240; pal[252*3+2] = 240; /* addr bar bg */
-    pal[253*3+0] =   0; pal[253*3+1] =   0; pal[253*3+2] =   0; /* addr bar txt*/
-    pal[254*3+0] =   0; pal[254*3+1] = 120; pal[254*3+2] = 215; /* highlight */
+    pal[250*3+0] =  64; pal[250*3+1] =  64; pal[250*3+2] =  64;
+    pal[251*3+0] = 255; pal[251*3+1] = 255; pal[251*3+2] = 255;
+    pal[252*3+0] = 240; pal[252*3+1] = 240; pal[252*3+2] = 240;
+    pal[253*3+0] =   0; pal[253*3+1] =   0; pal[253*3+2] =   0;
+    pal[254*3+0] =   0; pal[254*3+1] = 120; pal[254*3+2] = 215;
 
     /* 255 = magenta key color */
     pal[255*3+0] = 255; pal[255*3+1] =   0; pal[255*3+2] = 255;
@@ -143,7 +155,8 @@ static void yt_parse_start(YTContext *yt, const uint8_t *payload, uint16_t len)
     memcpy(&yt->video_w, payload + 0, 2);
     memcpy(&yt->video_h, payload + 2, 2);
     yt->fps = payload[4];
-    /* skip audio_rate (2 bytes at offset 5) and audio_bits (1 byte at 7) */
+    memcpy(&yt->audio_rate, payload + 5, 2);
+    yt->audio_bits = payload[7];
     memcpy(&yt->duration_ms, payload + 8, 4);
     yt->duration_ms *= 1000;  /* convert seconds to ms */
     memcpy(&title_len, payload + 12, 2);
@@ -153,6 +166,13 @@ static void yt_parse_start(YTContext *yt, const uint8_t *payload, uint16_t len)
         memcpy(yt->title, payload + 14, title_len);
     }
     yt->title[title_len] = '\0';
+
+    /* Check if server is sending audio */
+    yt->has_audio = (yt->audio_rate > 0 && yt->audio_bits > 0);
+
+    printf("[YT] Start: %dx%d @%dfps audio=%uHz/%ubit has_audio=%d\n",
+           yt->video_w, yt->video_h, yt->fps,
+           yt->audio_rate, yt->audio_bits, yt->has_audio);
 }
 
 static void yt_apply_frame_chunk(YTContext *yt, const uint8_t *payload,
@@ -205,6 +225,33 @@ static void yt_apply_frame_chunk(YTContext *yt, const uint8_t *payload,
     }
 }
 
+/* ---- Audio message handling ---- */
+
+static void yt_handle_audio(YTContext *yt, const uint8_t *payload,
+                             uint16_t len)
+{
+    uint16_t sample_count;
+
+    /* MSG_YT_AUDIO payload: timestamp_ms(4) + sample_count(2) + data[] */
+    if (len < 6) return;
+    if (!yt->sb_available) return;
+
+    memcpy(&sample_count, payload + 4, 2);
+    if (6 + sample_count > len) return;
+
+    sb_feed(payload + 6, sample_count);
+    yt->audio_msgs++;
+
+    /* Start DMA playback after 3 audio chunks (~300ms buffered).
+     * Can't use sb_buffer_ms() here because sample_rate isn't set
+     * until sb_start() is called. */
+    if (!yt->sb_started && yt->audio_msgs >= 3) {
+        if (sb_start(yt->audio_rate) == 0) {
+            yt->sb_started = 1;
+        }
+    }
+}
+
 /* ---- Main YouTube loop ---- */
 
 int run_youtube(Config *cfg, VideoConfig *vc, net_context_t *ctx,
@@ -218,8 +265,6 @@ int run_youtube(Config *cfg, VideoConfig *vc, net_context_t *ctx,
     int got_start = 0;
     clock_t timeout;
     int rc;
-
-    (void)cfg;
 
     memset(&yt, 0, sizeof(yt));
     yt.state = YT_STATE_IDLE;
@@ -259,6 +304,44 @@ int run_youtube(Config *cfg, VideoConfig *vc, net_context_t *ctx,
 
     if (!got_start) goto cleanup;
 
+    /* Show audio/SB info on loading screen for debug */
+    {
+        char dbg[80];
+        int dy = 0;
+
+        sprintf(dbg, "Audio: %uHz %ubit %s",
+                yt.audio_rate, yt.audio_bits,
+                yt.has_audio ? "YES" : "NO");
+        font_draw_string(yt.framebuf, YT_VIDEO_W, 4, 4 + dy,
+                         dbg, 215, 0, FONT_SMALL);
+        dy += 10;
+
+        /* Detect Sound Blaster if server is sending audio */
+        if (yt.has_audio) {
+            sprintf(dbg, "SB detect: base=%Xh irq=%d dma=%d",
+                    cfg->sb_base, cfg->sb_irq, cfg->sb_dma);
+            font_draw_string(yt.framebuf, YT_VIDEO_W, 4, 4 + dy,
+                             dbg, 215, 0, FONT_SMALL);
+            dy += 10;
+
+            yt.sb_available = (sb_detect(cfg->sb_base, cfg->sb_irq,
+                                         cfg->sb_dma) == 0);
+
+            sprintf(dbg, "SB result: %s",
+                    yt.sb_available ? "FOUND" : "NOT FOUND");
+            font_draw_string(yt.framebuf, YT_VIDEO_W, 4, 4 + dy,
+                             dbg, yt.sb_available ? 243 : 242, 0,
+                             FONT_SMALL);
+            dy += 10;
+        } else {
+            font_draw_string(yt.framebuf, YT_VIDEO_W, 4, 4 + dy,
+                             "Server sent no audio", 242, 0, FONT_SMALL);
+            dy += 10;
+        }
+
+        yt_flush_frame(&yt);
+    }
+
     yt.state = YT_STATE_PLAYING;
 
     /* Clear framebuffer for first real frame */
@@ -273,6 +356,9 @@ int run_youtube(Config *cfg, VideoConfig *vc, net_context_t *ctx,
         /* Poll network */
         net_poll();
 
+        /* Pump audio from ring buffer to DMA */
+        if (yt.sb_started) sb_pump();
+
         /* Receive and process messages */
         while (1) {
             prev_recv_pos = ctx->recv_pos;
@@ -286,6 +372,9 @@ int run_youtube(Config *cfg, VideoConfig *vc, net_context_t *ctx,
                     if (recv_retries < 50) {
                         net_poll();
                         recv_retries++;
+                        /* Pump audio during long receives */
+                        if (yt.sb_started && (recv_retries % 5) == 0)
+                            sb_pump();
                         continue;
                     }
                 }
@@ -299,6 +388,10 @@ int run_youtube(Config *cfg, VideoConfig *vc, net_context_t *ctx,
                 if (!(header.flags & FLAG_CONTINUED)) {
                     frame_done = 1;
                 }
+                break;
+
+            case MSG_YT_AUDIO:
+                yt_handle_audio(&yt, recv_buf, payload_len);
                 break;
 
             case MSG_YT_EOF:
@@ -324,9 +417,13 @@ int run_youtube(Config *cfg, VideoConfig *vc, net_context_t *ctx,
         /* Flush frame to VGA and send ACK */
         if (frame_done) {
             yt_flush_frame(&yt);
-            yt_send_ack(ctx, 0);  /* audio_buffer_ms = 0 (Phase 1) */
+            yt_send_ack(ctx,
+                yt.sb_available ? sb_buffer_ms() : 0);
             net_poll();  /* push ACK out immediately */
         }
+
+        /* Pump audio after frame render */
+        if (yt.sb_started) sb_pump();
 
         /* Handle keyboard */
         {
@@ -376,6 +473,12 @@ int run_youtube(Config *cfg, VideoConfig *vc, net_context_t *ctx,
     }
 
 cleanup:
+    /* Stop audio playback */
+    if (yt.sb_started) {
+        sb_stop();
+        yt.sb_started = 0;
+    }
+
     /* Free framebuffer */
     if (yt.framebuf) {
         free(yt.framebuf);

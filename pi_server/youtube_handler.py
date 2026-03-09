@@ -1,7 +1,8 @@
 """YouTube video extraction and transcoding for RetroSurf.
 
 Uses yt-dlp to extract stream URLs and ffmpeg to decode/scale video
-frames to raw RGB24 for the DOS client.
+frames to raw RGB24 for the DOS client. Phase 2 adds audio extraction
+(8-bit unsigned PCM mono).
 """
 
 import asyncio
@@ -35,12 +36,15 @@ class YouTubeHandler:
         self.width = config.get('youtube_width', 320)
         self.height = config.get('youtube_height', 200)
         self.fps = config.get('youtube_fps', 10)
+        self.audio_rate = 11025
 
         self.stream_url = None
         self.title = 'Unknown'
         self.duration = 0
 
         self._video_proc = None
+        self._audio_proc = None
+        self._audio_available = False
         self._frame_size = self.width * self.height * 3
 
     @staticmethod
@@ -112,7 +116,74 @@ class YouTubeHandler:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        print(f"[YouTube] ffmpeg started ({w}x{h} @ {fps} FPS)")
+        print(f"[YouTube] Video ffmpeg started ({w}x{h} @ {fps} FPS)")
+
+    async def start_audio(self):
+        """Start ffmpeg to extract audio as 8-bit unsigned mono PCM.
+
+        Uses the same stream URL as video. If the stream has no audio
+        track, ffmpeg will exit immediately and has_audio() returns False.
+        """
+        self._audio_proc = await asyncio.create_subprocess_exec(
+            self.ffmpeg_path,
+            '-i', self.stream_url,
+            '-vn',
+            '-ac', '1',
+            '-ar', str(self.audio_rate),
+            '-f', 'u8',
+            '-acodec', 'pcm_u8',
+            '-loglevel', 'error',
+            '-',
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+
+        # Quick check: try reading a small amount to verify audio is flowing
+        try:
+            test = await asyncio.wait_for(
+                self._audio_proc.stdout.read(1), timeout=3.0)
+            if test:
+                # Put the byte back by prepending to the stream buffer
+                self._audio_prebuf = test
+                self._audio_available = True
+                print(f"[YouTube] Audio ffmpeg started "
+                      f"({self.audio_rate} Hz, 8-bit unsigned mono)")
+            else:
+                self._audio_available = False
+                print("[YouTube] Audio stream empty (video-only format?)")
+        except asyncio.TimeoutError:
+            self._audio_available = False
+            print("[YouTube] Audio ffmpeg timeout (no audio track?)")
+
+    async def read_audio(self, num_samples):
+        """Read num_samples bytes of 8-bit unsigned mono PCM audio.
+
+        Returns bytes or None on EOF/error.
+        """
+        if not self._audio_available:
+            return None
+
+        try:
+            result = b''
+
+            # Drain any prebuf from the start_audio test read
+            if hasattr(self, '_audio_prebuf') and self._audio_prebuf:
+                result = self._audio_prebuf
+                self._audio_prebuf = b''
+
+            remaining = num_samples - len(result)
+            if remaining > 0:
+                data = await self._audio_proc.stdout.readexactly(remaining)
+                result += data
+
+            return result
+        except (asyncio.IncompleteReadError, Exception):
+            self._audio_available = False
+            return None
+
+    def has_audio(self):
+        """Check if audio extraction is active."""
+        return self._audio_available
 
     async def read_video_frame(self):
         """Read one raw RGB24 frame from ffmpeg stdout.
@@ -129,18 +200,21 @@ class YouTubeHandler:
             return None
 
     def is_running(self):
-        """Check if ffmpeg is still running."""
+        """Check if video ffmpeg is still running."""
         return (self._video_proc is not None and
                 self._video_proc.returncode is None)
 
     async def stop(self):
-        """Kill ffmpeg and clean up."""
-        if self._video_proc and self._video_proc.returncode is None:
-            try:
-                self._video_proc.kill()
-                # Timeout: process.wait() can hang on Windows
-                await asyncio.wait_for(self._video_proc.wait(), timeout=2.0)
-            except (ProcessLookupError, asyncio.TimeoutError):
-                pass
-            print("[YouTube] ffmpeg stopped")
+        """Kill ffmpeg processes and clean up."""
+        for name, proc in [('video', self._video_proc),
+                           ('audio', self._audio_proc)]:
+            if proc and proc.returncode is None:
+                try:
+                    proc.kill()
+                    await asyncio.wait_for(proc.wait(), timeout=2.0)
+                except (ProcessLookupError, asyncio.TimeoutError):
+                    pass
+        print("[YouTube] ffmpeg stopped")
         self._video_proc = None
+        self._audio_proc = None
+        self._audio_available = False
