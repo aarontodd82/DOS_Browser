@@ -267,3 +267,60 @@ int net_data_ready(void)
 {
     return sock_dataready(&tcp_sock) > 0 ? 1 : 0;
 }
+
+/* --- Non-blocking connect steps --- */
+
+int net_resolve_host(net_context_t *ctx, const char *server_ip)
+{
+    DWORD ip;
+
+    memset(ctx, 0, sizeof(net_context_t));
+    ctx->state = NET_CONNECTING;
+
+    ip = resolve(server_ip);
+    if (ip == 0) {
+        snprintf(ctx->error_msg, sizeof(ctx->error_msg),
+                 "Cannot resolve: %s", server_ip);
+        ctx->state = NET_ERROR;
+        return -1;
+    }
+    ctx->server_ip = ip;
+    return 0;
+}
+
+int net_start_connect(net_context_t *ctx, uint16_t port)
+{
+    ctx->server_port = port;
+
+    if (!tcp_open(&tcp_sock, 0, ctx->server_ip, port, NULL)) {
+        snprintf(ctx->error_msg, sizeof(ctx->error_msg),
+                 "tcp_open() failed");
+        ctx->state = NET_ERROR;
+        return -1;
+    }
+    return 0;
+}
+
+int net_poll_connect(net_context_t *ctx)
+{
+    if (!tcp_tick(&tcp_sock)) {
+        snprintf(ctx->error_msg, sizeof(ctx->error_msg),
+                 "Connection refused");
+        ctx->state = NET_ERROR;
+        return -1;
+    }
+    if (sock_established(&tcp_sock)) {
+        return 1;  /* Connected! */
+    }
+    return 0;  /* Still waiting */
+}
+
+void net_finish_connect(net_context_t *ctx)
+{
+    ctx->state = NET_CONNECTED;
+    ctx->recv_pos = 0;
+    ctx->recv_need = HEADER_SIZE;
+
+    /* Enlarge TCP receive buffer for high throughput */
+    sock_setbuf((sock_type *)&tcp_sock, big_rx_buf, BIG_RX_BUF_SIZE);
+}

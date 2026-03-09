@@ -102,6 +102,7 @@ class RetroSurfServer:
         print(f"\n[Server] Client connected from {addr}")
 
         seq = SequenceCounter()
+        session = None
 
         try:
             # --- Handshake ---
@@ -204,18 +205,45 @@ class RetroSurfServer:
             # them as one combined scroll before the next frame capture
             scroll_accum = {'dy_pixels': 0, 'last_time': 0}
 
-            # Run push and receive loops concurrently
-            await asyncio.gather(
-                self._push_loop(writer, session, seq, frame_ack_event, scroll_accum),
-                self._receive_loop(reader, writer, session, seq, frame_ack_event, scroll_accum),
+            # Run push and receive loops as separate tasks so we can
+            # cancel the survivor when one dies (e.g. client disconnect).
+            push_task = asyncio.create_task(
+                self._push_loop(writer, session, seq,
+                                frame_ack_event, scroll_accum))
+            recv_task = asyncio.create_task(
+                self._receive_loop(reader, writer, session, seq,
+                                   frame_ack_event, scroll_accum))
+
+            done, pending = await asyncio.wait(
+                [push_task, recv_task],
+                return_when=asyncio.FIRST_COMPLETED,
             )
 
-        except asyncio.IncompleteReadError:
-            print(f"[Server] Client {addr} disconnected (incomplete read)")
-        except ConnectionResetError:
-            print(f"[Server] Client {addr} connection reset")
+            # Cancel the surviving task
+            for task in pending:
+                task.cancel()
+            for task in pending:
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
+
+            # Re-raise exception from the completed task (if any)
+            for task in done:
+                if not task.cancelled():
+                    exc = task.exception()
+                    if exc:
+                        raise exc
+
+        except (asyncio.IncompleteReadError, ConnectionResetError,
+                ConnectionAbortedError, BrokenPipeError):
+            print(f"[Server] Client {addr} disconnected")
+        except OSError as e:
+            print(f"[Server] Client {addr} connection error: {e}")
         except asyncio.TimeoutError:
             print(f"[Server] Client {addr} timed out during handshake")
+        except asyncio.CancelledError:
+            print(f"[Server] Client {addr} handler cancelled (shutdown)")
         except Exception as e:
             print(f"[Server] Error handling client {addr}: {e}")
             import traceback
@@ -226,7 +254,17 @@ class RetroSurfServer:
                 await writer.wait_closed()
             except Exception:
                 pass
-            print(f"[Server] Client {addr} connection closed")
+
+            # Close session to free browser resources immediately
+            if session and session.session_id in self.sessions:
+                try:
+                    await session.close()
+                except Exception:
+                    pass
+                self.sessions.pop(session.session_id, None)
+
+            print(f"[Server] Client {addr} session ended")
+            print(f"[Server] Waiting for next client connection...")
 
     async def _push_loop(self, writer, session, seq, frame_ack_event,
                          scroll_accum):
@@ -256,7 +294,8 @@ class RetroSurfServer:
         last_capture_time = 0
         NAV_BURST_MIN_INTERVAL = 0.15  # 150ms between captures during page load
 
-        while True:
+        try:
+         while True:
             # Wait for client ACK (or timeout as safety net)
             t_ack_wait = time.perf_counter()
             try:
@@ -288,6 +327,8 @@ class RetroSurfServer:
                             elements, sy, sh = await session.get_interaction_map()
                             map_payload = encode_interaction_map(elements, sy, sh)
                             await self._send_message(writer, MSG_INTERACTION_MAP, map_payload, seq)
+                        except (ConnectionError, OSError):
+                            raise
                         except Exception:
                             pass
                         last_interaction_time = now
@@ -295,6 +336,8 @@ class RetroSurfServer:
                         try:
                             status_text = await session.get_status_text()
                             await self._send_message(writer, MSG_STATUS, encode_status(status_text), seq)
+                        except (ConnectionError, OSError):
+                            raise
                         except Exception:
                             pass
                         last_status_time = now
@@ -312,6 +355,8 @@ class RetroSurfServer:
                         status_text = '[N] ' + status_text
                         await self._send_message(writer, MSG_STATUS,
                                                  encode_status(status_text), seq)
+                    except (ConnectionError, OSError):
+                        raise
                     except Exception:
                         pass
                     last_status_time = now
@@ -377,6 +422,8 @@ class RetroSurfServer:
                     elements, sy, sh = await session.get_interaction_map()
                     map_payload = encode_interaction_map(elements, sy, sh)
                     await self._send_message(writer, MSG_INTERACTION_MAP, map_payload, seq)
+                except (ConnectionError, OSError):
+                    raise
                 except Exception:
                     pass
                 last_interaction_time = now
@@ -384,9 +431,16 @@ class RetroSurfServer:
                 try:
                     status_text = await session.get_status_text()
                     await self._send_message(writer, MSG_STATUS, encode_status(status_text), seq)
+                except (ConnectionError, OSError):
+                    raise
                 except Exception:
                     pass
                 last_status_time = now
+
+        except (ConnectionError, OSError):
+            return  # Client disconnected — exit cleanly
+        except asyncio.CancelledError:
+            return  # Task cancelled (sibling died or shutdown)
 
     async def _receive_loop(self, reader, writer, session, seq, frame_ack_event,
                             scroll_accum):
@@ -573,7 +627,9 @@ class RetroSurfServer:
         await session.inject_text_input(data['element_id'], data['text'])
 
     async def _send_message(self, writer, msg_type, payload, seq):
-        """Send a single protocol message."""
+        """Send a single protocol message. Raises on dead connection."""
+        if writer.is_closing():
+            raise ConnectionError("Connection closing")
         msg = encode_message(msg_type, payload, seq.next())
         writer.write(msg)
         await writer.drain()
@@ -723,6 +779,8 @@ class RetroSurfServer:
                           f"({len(img_payload)} bytes, "
                           f"{len(img_messages)} chunks)")
 
+        except (ConnectionError, OSError):
+            raise  # Let connection errors propagate to caller
         except Exception as e:
             print(f"[Server] Native content extraction failed: {e}")
             import traceback
@@ -731,9 +789,12 @@ class RetroSurfServer:
             session.render_mode = 'screenshot'
             if session.pipeline:
                 session.pipeline.prev_indexed = None
-            await self._send_message(
-                writer, MSG_MODE_SWITCH,
-                encode_mode_switch(0), seq)
+            try:
+                await self._send_message(
+                    writer, MSG_MODE_SWITCH,
+                    encode_mode_switch(0), seq)
+            except (ConnectionError, OSError):
+                raise
             return False
 
         return True
@@ -803,22 +864,34 @@ class RetroSurfServer:
                 await session.close()
 
     async def shutdown(self):
-        """Clean shutdown."""
-        print("[Server] Shutting down...")
+        """Clean shutdown — suppress errors since browser may already be gone."""
+        print("\n[Server] Shutting down...")
 
-        for session in self.sessions.values():
-            await session.close()
+        for session in list(self.sessions.values()):
+            try:
+                await session.close()
+            except Exception:
+                pass
         self.sessions.clear()
 
         if self.browser:
-            await self.browser.close()
+            try:
+                await self.browser.close()
+            except Exception:
+                pass
         if self.playwright:
-            await self.playwright.stop()
+            try:
+                await self.playwright.stop()
+            except Exception:
+                pass
 
         print("[Server] Shutdown complete.")
 
 
-async def main():
+def run_server():
+    """Entry point with clean Ctrl+C handling."""
+    import signal
+
     parser = argparse.ArgumentParser(description='RetroSurf Rendering Server')
     parser.add_argument('--port', type=int, default=None,
                         help='TCP port (default: 8086)')
@@ -837,13 +910,20 @@ async def main():
 
     server = RetroSurfServer(config)
 
+    async def _run():
+        try:
+            await server.start()
+        except asyncio.CancelledError:
+            pass
+        finally:
+            await server.shutdown()
+
     try:
-        await server.start()
+        asyncio.run(_run())
     except KeyboardInterrupt:
-        pass
-    finally:
-        await server.shutdown()
+        # asyncio.run already cancelled tasks — just print clean exit
+        print("\n[Server] Interrupted. Goodbye.")
 
 
 if __name__ == '__main__':
-    asyncio.run(main())
+    run_server()

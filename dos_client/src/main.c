@@ -32,105 +32,152 @@
 
 static uint8_t payload_buf[MAX_PAYLOAD_SIZE];
 
-/* Simple test palette: basic 16 colors + grayscale ramp */
-static void set_test_palette(void)
+/* 6x6x6 RGB cube palette — matches the server palette so chrome
+ * colors (black=0, white=215, light gray=172) work from startup. */
+static void set_startup_palette(void)
 {
     uint8_t pal[768];
-    int i;
+    int r, g, b, i;
 
     memset(pal, 0, sizeof(pal));
 
-    /* Standard 16 CGA/EGA colors */
-    pal[0] = 0;   pal[1] = 0;   pal[2] = 0;       /* 0: Black */
-    pal[3] = 0;   pal[4] = 0;   pal[5] = 168;     /* 1: Dark Blue */
-    pal[6] = 0;   pal[7] = 168; pal[8] = 0;       /* 2: Dark Green */
-    pal[9] = 0;   pal[10] = 168; pal[11] = 168;   /* 3: Dark Cyan */
-    pal[12] = 168; pal[13] = 0;  pal[14] = 0;     /* 4: Dark Red */
-    pal[15] = 168; pal[16] = 0;  pal[17] = 168;   /* 5: Dark Magenta */
-    pal[18] = 168; pal[19] = 84; pal[20] = 0;     /* 6: Brown */
-    pal[21] = 168; pal[22] = 168; pal[23] = 168;  /* 7: Light Gray */
-    pal[24] = 84;  pal[25] = 84;  pal[26] = 84;   /* 8: Dark Gray */
-    pal[27] = 84;  pal[28] = 84;  pal[29] = 252;  /* 9: Light Blue */
-    pal[30] = 84;  pal[31] = 252; pal[32] = 84;   /* 10: Light Green */
-    pal[33] = 84;  pal[34] = 252; pal[35] = 252;  /* 11: Light Cyan */
-    pal[36] = 252; pal[37] = 84;  pal[38] = 84;   /* 12: Light Red */
-    pal[39] = 252; pal[40] = 84;  pal[41] = 252;  /* 13: Light Magenta */
-    pal[42] = 252; pal[43] = 252; pal[44] = 84;   /* 14: Yellow */
-    pal[45] = 252; pal[46] = 252; pal[47] = 252;  /* 15: White */
+    /* 6x6x6 RGB cube (indices 0-215) */
+    for (r = 0; r < 6; r++) {
+        for (g = 0; g < 6; g++) {
+            for (b = 0; b < 6; b++) {
+                i = r * 36 + g * 6 + b;
+                pal[i * 3 + 0] = (uint8_t)(r * 51);
+                pal[i * 3 + 1] = (uint8_t)(g * 51);
+                pal[i * 3 + 2] = (uint8_t)(b * 51);
+            }
+        }
+    }
 
-    /* Grayscale ramp in entries 16-255 */
-    for (i = 16; i < 256; i++) {
-        uint8_t v = (uint8_t)((i - 16) * 255 / 239);
+    /* Grayscale ramp (indices 216-239) */
+    for (i = 216; i < 240; i++) {
+        uint8_t v = (uint8_t)((i - 216) * 255 / 23);
         pal[i * 3 + 0] = v;
         pal[i * 3 + 1] = v;
         pal[i * 3 + 2] = v;
     }
 
+    /* White at 249 (used by some chrome code paths) */
+    pal[249 * 3 + 0] = 255;
+    pal[249 * 3 + 1] = 255;
+    pal[249 * 3 + 2] = 255;
+
     video_set_palette(pal, 256);
 }
 
-/* Phase 1 splash screen */
-static void show_splash(VideoConfig *vc)
+/* === Dial-up Connection Dialog === */
+
+/* 6x6x6 palette colors for the dialog */
+#define COL_DLG_BG       0     /* Black background */
+#define COL_DLG_BORDER   18    /* Dark green (0,153,0) */
+#define COL_DLG_TITLE_BG 3     /* Dark blue (0,0,153) */
+#define COL_DLG_TITLE_FG 215   /* White */
+#define COL_DLG_TEXT     30    /* Bright green (0,255,0) */
+#define COL_DLG_DIM      18    /* Dark green for secondary text */
+#define COL_DLG_ERR      180   /* Red (255,0,0) */
+
+#define DLG_W         340
+#define DLG_H         170
+#define DLG_TITLE_H    18
+#define DLG_PAD         8
+#define DLG_LINE_H     12
+#define DLG_MAX_LINES  10
+
+typedef struct {
+    uint16_t x, y, w, h;
+    int      line_count;
+    char     lines[DLG_MAX_LINES][52];
+    uint8_t  line_colors[DLG_MAX_LINES];
+} ConnectDialog;
+
+static void dialog_init(ConnectDialog *dlg, VideoConfig *vc)
 {
-    const char *title = "RetroSurf v0.1";
-    const char *subtitle = "DOS Web Browser";
-    const char *prompt;
-    int tx, ty, sx, sy;
+    uint16_t content_top = vc->chrome_height;
+    uint16_t content_h = vc->height - content_top - 12; /* minus status */
 
-    set_test_palette();
+    dlg->w = DLG_W;
+    dlg->h = DLG_H;
+    dlg->x = (vc->width - dlg->w) / 2;
+    dlg->y = content_top + (content_h - dlg->h) / 2;
+    dlg->line_count = 0;
+}
 
-    video_fill_rect(vc, 0, 0, vc->width, vc->height, 1);
-    video_fill_rect(vc, 0, 0, vc->width, vc->chrome_height, 8);
-    video_fill_rect(vc, 80, 4, vc->width - 88, vc->chrome_height - 8, 7);
+static void dialog_draw(ConnectDialog *dlg, VideoConfig *vc)
+{
+    int i, tx, ty;
+    const char *title = "RetroSurf - Connecting";
 
-    font_draw_string(vc->backbuffer, vc->width, 4, 4,
-                     "[<][>][R]", 15, 8, FONT_LARGE);
-    font_draw_string(vc->backbuffer, vc->width, 84, 4,
-                     "https://retrosurf.local", 0, 7, FONT_LARGE);
+    /* Border (dark green frame) */
+    video_fill_rect(vc, dlg->x - 2, dlg->y - 2,
+                    dlg->w + 4, dlg->h + 4, COL_DLG_BORDER);
 
-    tx = (vc->width - font_string_width(title, FONT_LARGE)) / 2;
-    ty = vc->height / 2 - 40;
+    /* Black interior */
+    video_fill_rect(vc, dlg->x, dlg->y, dlg->w, dlg->h, COL_DLG_BG);
+
+    /* Title bar (dark blue) */
+    video_fill_rect(vc, dlg->x, dlg->y, dlg->w, DLG_TITLE_H,
+                    COL_DLG_TITLE_BG);
+
+    /* Title text (centered) */
+    tx = dlg->x + (dlg->w - font_string_width(title, FONT_MEDIUM)) / 2;
+    ty = dlg->y + (DLG_TITLE_H - font_char_height(FONT_MEDIUM)) / 2;
     font_draw_string(vc->backbuffer, vc->width, tx, ty,
-                     title, 14, 255, FONT_LARGE);
+                     title, COL_DLG_TITLE_FG, COL_DLG_TITLE_BG,
+                     FONT_MEDIUM);
 
-    sx = (vc->width - font_string_width(subtitle, FONT_MEDIUM)) / 2;
-    sy = ty + 24;
-    font_draw_string(vc->backbuffer, vc->width, sx, sy,
-                     subtitle, 11, 255, FONT_MEDIUM);
+    /* Separator below title */
+    video_fill_rect(vc, dlg->x, dlg->y + DLG_TITLE_H,
+                    dlg->w, 1, COL_DLG_BORDER);
 
-    {
-        char buf[80];
-        sprintf(buf, "Mode: %ux%u %ubpp %s",
-                vc->width, vc->height, vc->bpp,
-                vc->has_lfb ? "LFB" : "Banked");
-        tx = (vc->width - font_string_width(buf, FONT_SMALL)) / 2;
-        font_draw_string(vc->backbuffer, vc->width, tx, sy + 24,
-                         buf, 7, 255, FONT_SMALL);
-
-        sprintf(buf, "Content: %ux%u  Tiles: %ux%u = %u",
-                vc->content_width, vc->content_height,
-                vc->tile_cols, vc->tile_rows, vc->tile_total);
-        tx = (vc->width - font_string_width(buf, FONT_SMALL)) / 2;
-        font_draw_string(vc->backbuffer, vc->width, tx, sy + 36,
-                         buf, 7, 255, FONT_SMALL);
+    /* Modem text lines */
+    for (i = 0; i < dlg->line_count && i < DLG_MAX_LINES; i++) {
+        tx = dlg->x + DLG_PAD;
+        ty = dlg->y + DLG_TITLE_H + 6 + i * DLG_LINE_H;
+        font_draw_string(vc->backbuffer, vc->width, tx, ty,
+                         dlg->lines[i], dlg->line_colors[i],
+                         COL_DLG_BG, FONT_SMALL);
     }
 
-    {
-        int i, bx, by;
-        bx = (vc->width - 16 * 20) / 2;
-        by = sy + 56;
-        for (i = 0; i < 16; i++)
-            video_fill_rect(vc, bx + i * 20, by, 18, 18, i);
+    video_mark_dirty(vc, dlg->x - 2, dlg->y - 2,
+                     dlg->w + 4, dlg->h + 4);
+}
+
+static void dialog_add_line(ConnectDialog *dlg, VideoConfig *vc,
+                             const char *text, uint8_t color)
+{
+    if (dlg->line_count >= DLG_MAX_LINES) return;
+    strncpy(dlg->lines[dlg->line_count], text, 51);
+    dlg->lines[dlg->line_count][51] = '\0';
+    dlg->line_colors[dlg->line_count] = color;
+    dlg->line_count++;
+    dialog_draw(dlg, vc);
+    video_flush_dirty(vc);
+}
+
+static void dialog_update_last(ConnectDialog *dlg, VideoConfig *vc,
+                                const char *text, uint8_t color)
+{
+    int i;
+    if (dlg->line_count <= 0) return;
+    i = dlg->line_count - 1;
+    strncpy(dlg->lines[i], text, 51);
+    dlg->lines[i][51] = '\0';
+    dlg->line_colors[i] = color;
+    dialog_draw(dlg, vc);
+    video_flush_dirty(vc);
+}
+
+/* Small delay that keeps the TCP stack alive */
+static void delay_ms(int ms)
+{
+    clock_t end = clock() + (clock_t)ms * CLOCKS_PER_SEC / 1000;
+    while (clock() < end) {
+        net_poll();
     }
-
-    prompt = "Press any key to continue...";
-    tx = (vc->width - font_string_width(prompt, FONT_MEDIUM)) / 2;
-    font_draw_string(vc->backbuffer, vc->width, tx, vc->height - 30,
-                     prompt, 15, 255, FONT_MEDIUM);
-
-    video_flush_full(vc);
-    while (!kbhit()) {}
-    getch();
 }
 
 /* Process a CURSOR_SHAPE message */
@@ -174,8 +221,8 @@ static int run_browser(Config *cfg, VideoConfig *vc, net_context_t *passed_ctx)
     int rc;
     msg_header_t header;
     uint16_t payload_len;
-    server_hello_t server_hello;
     int quit = 0;
+    int disconnected = 0;
     int render_mode = 0;  /* 0 = screenshot, 1 = native */
 
     /* Initialize subsystems */
@@ -189,49 +236,19 @@ static int run_browser(Config *cfg, VideoConfig *vc, net_context_t *passed_ctx)
         printf("WARNING: Native renderer init failed\n");
     }
 
-    chrome_set_status(&chrome, "Connected");
-
     rc = render_init(&render, vc);
     if (rc != 0) return 1;
 
     /* Initialize mouse (after video is set) */
     input_init_mouse(vc->width, vc->height);
 
-    /* === Handshake === */
-    {
-        uint8_t hello_buf[64];
-        int payload_size = proto_encode_client_hello(
-            hello_buf, vc->width, vc->height,
-            vc->bpp, TILE_SIZE, vc->chrome_height, 32, 0
-        );
-        rc = net_send_message(&ctx, MSG_CLIENT_HELLO, hello_buf, payload_size);
-        if (rc != 0) goto disconnect;
-    }
-
-    /* Wait for SERVER_HELLO */
-    while (1) {
-        net_poll();
-        rc = net_recv_message(&ctx, &header, payload_buf, &payload_len);
-        if (rc < 0) goto disconnect;
-        if (rc == 1) break;
-    }
-    if (header.msg_type != MSG_SERVER_HELLO) goto disconnect;
-    proto_decode_server_hello(payload_buf, &server_hello);
-
-    /* Wait for PALETTE */
-    while (1) {
-        net_poll();
-        rc = net_recv_message(&ctx, &header, payload_buf, &payload_len);
-        if (rc < 0) goto disconnect;
-        if (rc == 1) break;
-    }
-    if (header.msg_type != MSG_PALETTE) goto disconnect;
-    video_set_palette(payload_buf, payload_len / 3);
-
-    /* Draw initial chrome */
+    /* Draw initial chrome (handshake already done by caller) */
     chrome_set_url(&chrome, cfg->home_url);
     chrome_set_status(&chrome, "Loading...");
     chrome_draw(&chrome, vc);
+    /* Clear content area (remove any dialog remnants) */
+    video_fill_rect(vc, 0, vc->chrome_height, vc->width,
+                    chrome.status_y - vc->chrome_height, 0);
     video_flush_full(vc);
 
     /* === Main Loop === */
@@ -259,7 +276,7 @@ static int run_browser(Config *cfg, VideoConfig *vc, net_context_t *passed_ctx)
         while (1) {
             prev_recv_pos = ctx.recv_pos;
             rc = net_recv_message(&ctx, &header, payload_buf, &payload_len);
-            if (rc < 0) { quit = 1; break; }
+            if (rc < 0) { quit = 1; disconnected = 1; break; }
             if (rc == 0) {
                 /* No data yet - if mid-message, pump TCP and retry */
                 if (ctx.recv_pos > 0) {
@@ -711,108 +728,268 @@ static int run_browser(Config *cfg, VideoConfig *vc, net_context_t *passed_ctx)
     }
     }
 
-disconnect:
     native_shutdown(&native);
     render_shutdown(&render);
     net_close(&ctx);
-    net_shutdown();
-    return 0;
+    /* 0 = user quit (ESC), 1 = disconnected (server went away) */
+    return disconnected ? 1 : 0;
 }
 
 int main(int argc, char *argv[])
 {
     Config cfg;
     VideoConfig vc;
+    net_context_t ctx;
+    ConnectDialog dlg;
+    ChromeState boot_chrome;
+    msg_header_t header;
+    uint16_t payload_len;
     int rc;
+    int reconnecting = 0;
 
-    printf("\n");
-    printf("========================================\n");
-    printf("  RetroSurf v0.1.0\n");
-    printf("========================================\n\n");
+    printf("\n  RetroSurf v0.1.0\n\n");
 
     /* Load configuration */
     if (config_load(&cfg, "RETRO.CFG") == 0)
-        printf("Config loaded from RETRO.CFG\n");
+        printf("Config: RETRO.CFG  Server: %s:%u\n",
+               cfg.server_ip, cfg.server_port);
     else
-        printf("Using default config\n");
-    printf("  Server: %s:%u\n", cfg.server_ip, cfg.server_port);
-    printf("  Home:   %s\n\n", cfg.home_url);
+        printf("Using defaults  Server: %s:%u\n",
+               cfg.server_ip, cfg.server_port);
 
     if (argc > 1) strncpy(cfg.server_ip, argv[1], sizeof(cfg.server_ip) - 1);
     if (argc > 2) cfg.server_port = (uint16_t)atoi(argv[2]);
 
-    /* Initialize fonts */
-    printf("Loading fonts...\n");
+    /* Initialize fonts (text mode) */
     rc = font_init();
     if (rc != 0) {
         printf("ERROR: Font init failed\n");
         getch();
         return 1;
     }
-    printf("Fonts loaded (8x8, 8x14, 8x16)\n");
 
-    /* Initialize video */
-    printf("Initializing video...\n");
-    rc = video_init(&vc, cfg.video_mode);
+    /* Initialize TCP/IP stack (text mode — prints debug info) */
+    rc = net_init();
     if (rc != 0) {
-        printf("ERROR: Video init failed\n");
+        printf("Network init failed. Press any key.\n");
         getch();
         return 1;
     }
 
-    /* Show splash screen */
-    show_splash(&vc);
+    /* === Switch to graphics mode === */
+    rc = video_init(&vc, cfg.video_mode);
+    if (rc != 0) {
+        printf("ERROR: Video init failed\n");
+        net_shutdown();
+        getch();
+        return 1;
+    }
 
-    /* Back to text mode for connection */
-    video_shutdown(&vc);
+    /* Set up 6x6x6 palette so chrome colors work immediately */
+    set_startup_palette();
 
-    printf("\nPress any key to connect to server, ESC to quit.\n");
+    /* ============================================================
+     * Connection loop — handles initial connect AND reconnection.
+     * Retries indefinitely until server is reachable or ESC pressed.
+     * ============================================================ */
+connect:
+    /* Draw browser chrome */
+    chrome_init(&boot_chrome, &vc);
+    chrome_set_url(&boot_chrome, cfg.home_url);
+    chrome_set_status(&boot_chrome,
+                      reconnecting ? "Reconnecting..." : "Connecting...");
+    chrome_draw(&boot_chrome, &vc);
+    video_fill_rect(&vc, 0, vc.chrome_height, vc.width,
+                    boot_chrome.status_y - vc.chrome_height, 0);
+    video_flush_full(&vc);
+
+    /* Init connection dialog */
+    dialog_init(&dlg, &vc);
+
+    if (reconnecting) {
+        /* Reconnect: brief message then straight to dialing */
+        dialog_add_line(&dlg, &vc, "Connection lost.", COL_DLG_ERR);
+        dialog_add_line(&dlg, &vc, "", COL_DLG_TEXT);
+        /* Reset palette in case server palette was weird */
+        set_startup_palette();
+    } else {
+        /* First connect: modem init sequence (cosmetic) */
+        dialog_add_line(&dlg, &vc, "ATZ", COL_DLG_DIM);
+        delay_ms(300);
+        dialog_update_last(&dlg, &vc,
+            "ATZ                                  OK", COL_DLG_TEXT);
+        delay_ms(200);
+        dialog_add_line(&dlg, &vc, "AT&F1", COL_DLG_DIM);
+        delay_ms(250);
+        dialog_update_last(&dlg, &vc,
+            "AT&F1                                OK", COL_DLG_TEXT);
+        delay_ms(200);
+    }
+
+    /* Show dial command */
     {
-        int key = getch();
-        if (key == 27) {
-            printf("Exiting.\n");
-            return 0;
+        char dial_str[80];
+        sprintf(dial_str, "ATDT %s:%u", cfg.server_ip, cfg.server_port);
+        dialog_add_line(&dlg, &vc, dial_str, COL_DLG_TEXT);
+    }
+
+    /* === Connection retry loop === */
+    {
+        int attempt = 0;
+        int connected = 0;
+
+        dialog_add_line(&dlg, &vc, "RINGING...", COL_DLG_DIM);
+
+        while (!connected) {
+            attempt++;
+
+            /* Resolve host */
+            rc = net_resolve_host(&ctx, cfg.server_ip);
+            if (rc != 0) {
+                char s[52];
+                sprintf(s, "NO CARRIER - Retry %d...", attempt);
+                dialog_update_last(&dlg, &vc, s, COL_DLG_ERR);
+                delay_ms(3000);
+                if (kbhit() && getch() == 27) goto cleanup;
+                continue;
+            }
+
+            /* Start TCP connection */
+            rc = net_start_connect(&ctx, cfg.server_port);
+            if (rc != 0) {
+                char s[52];
+                sprintf(s, "NO CARRIER - Retry %d...", attempt);
+                dialog_update_last(&dlg, &vc, s, COL_DLG_ERR);
+                delay_ms(3000);
+                if (kbhit() && getch() == 27) goto cleanup;
+                continue;
+            }
+
+            /* Poll for TCP connection (5s per attempt) */
+            {
+                clock_t poll_deadline = clock() + 5 * CLOCKS_PER_SEC;
+                clock_t last_anim = clock();
+                int dots = 0;
+
+                /* Show ringing with attempt count */
+                if (attempt > 1) {
+                    char s[52];
+                    sprintf(s, "RINGING...              (attempt %d)",
+                            attempt);
+                    dialog_update_last(&dlg, &vc, s, COL_DLG_DIM);
+                }
+
+                while (clock() < poll_deadline) {
+                    rc = net_poll_connect(&ctx);
+                    if (rc == 1) { connected = 1; break; }
+                    if (rc == -1) break; /* refused — will retry */
+
+                    if (kbhit() && getch() == 27) goto cleanup;
+
+                    /* Animate dots every ~500ms */
+                    if (clock() - last_anim >= CLOCKS_PER_SEC / 2) {
+                        char ring[52];
+                        dots = (dots + 1) % 4;
+                        if (attempt > 1)
+                            sprintf(ring,
+                                "RINGING%.*s             (attempt %d)",
+                                dots, "...", attempt);
+                        else
+                            sprintf(ring, "RINGING%.*s   ",
+                                    dots, "...");
+                        dialog_update_last(&dlg, &vc, ring, COL_DLG_DIM);
+                        last_anim = clock();
+                    }
+                }
+
+                if (!connected) {
+                    /* Timeout or refused — wait then retry */
+                    char s[52];
+                    sprintf(s, "NO CARRIER - Retry %d...", attempt + 1);
+                    dialog_update_last(&dlg, &vc, s, COL_DLG_ERR);
+                    delay_ms(3000);
+                    if (kbhit() && getch() == 27) goto cleanup;
+                }
+            }
         }
     }
 
-    /* Connect in text mode so user can see errors */
-    {
-        net_context_t ctx;
-        rc = net_init();
-        if (rc != 0) {
-            printf("Network init failed. Press any key.\n");
-            getch();
-            return 1;
-        }
-        rc = net_connect(&ctx, cfg.server_ip, cfg.server_port);
-        if (rc != 0) {
-            printf("Connection failed: %s\n", ctx.error_msg);
-            printf("Press any key to exit.\n");
-            net_shutdown();
-            getch();
-            return 1;
-        }
-        printf("Connected! Starting browser...\n");
+    /* Connected! */
+    net_finish_connect(&ctx);
+    dialog_update_last(&dlg, &vc, "CONNECT 9600", COL_DLG_TEXT);
+    delay_ms(300);
 
-        /* Re-init video */
-        rc = video_init(&vc, cfg.video_mode);
+    /* === Protocol handshake === */
+    dialog_add_line(&dlg, &vc, "", COL_DLG_TEXT);
+    dialog_add_line(&dlg, &vc, "Negotiating protocol...", COL_DLG_DIM);
+
+    /* Send CLIENT_HELLO */
+    {
+        uint8_t hello_buf[64];
+        int payload_size = proto_encode_client_hello(
+            hello_buf, vc.width, vc.height,
+            vc.bpp, TILE_SIZE, vc.chrome_height, 32, 0
+        );
+        rc = net_send_message(&ctx, MSG_CLIENT_HELLO, hello_buf, payload_size);
         if (rc != 0) {
-            printf("ERROR: Video re-init failed\n");
+            /* Handshake send failed — reconnect */
             net_close(&ctx);
-            net_shutdown();
-            getch();
-            return 1;
+            reconnecting = 1;
+            goto connect;
         }
-        set_test_palette();
-
-        /* Run browser (pass connected context) */
-        run_browser(&cfg, &vc, &ctx);
     }
 
-    /* Cleanup */
+    /* Wait for SERVER_HELLO */
+    {
+        clock_t deadline = clock() + 10 * CLOCKS_PER_SEC;
+        rc = 0;
+        while (clock() < deadline) {
+            net_poll();
+            rc = net_recv_message(&ctx, &header, payload_buf, &payload_len);
+            if (rc < 0) break;
+            if (rc == 1) break;
+        }
+        if (rc != 1 || header.msg_type != MSG_SERVER_HELLO) {
+            net_close(&ctx);
+            reconnecting = 1;
+            goto connect;
+        }
+    }
+
+    /* Wait for PALETTE */
+    {
+        clock_t deadline = clock() + 10 * CLOCKS_PER_SEC;
+        while (clock() < deadline) {
+            net_poll();
+            rc = net_recv_message(&ctx, &header, payload_buf, &payload_len);
+            if (rc < 0) break;
+            if (rc == 1) break;
+        }
+        if (rc == 1 && header.msg_type == MSG_PALETTE) {
+            video_set_palette(payload_buf, payload_len / 3);
+        }
+    }
+
+    dialog_update_last(&dlg, &vc,
+        "Negotiating protocol...              OK", COL_DLG_TEXT);
+    delay_ms(200);
+    dialog_add_line(&dlg, &vc, "Loading homepage...", COL_DLG_TEXT);
+    delay_ms(400);
+
+    /* === Launch the browser === */
+    rc = run_browser(&cfg, &vc, &ctx);
+
+    if (rc == 1) {
+        /* Disconnected — reconnect automatically */
+        reconnecting = 1;
+        goto connect;
+    }
+
+    /* rc == 0: user pressed ESC to quit */
+
+cleanup:
     video_shutdown(&vc);
+    net_shutdown();
     printf("RetroSurf exited.\n");
-    printf("Press any key.\n");
-    getch();
     return 0;
 }

@@ -80,4 +80,22 @@ void net_poll(void);
  * Returns 1 if data ready, 0 if not. */
 int net_data_ready(void);
 
+/* --- Non-blocking connect steps (for visual connection sequence) --- */
+
+/* Resolve the server hostname/IP. Fills ctx->server_ip.
+ * Returns 0 on success, -1 on failure (error in ctx->error_msg). */
+int net_resolve_host(net_context_t *ctx, const char *server_ip);
+
+/* Start a TCP connection (non-blocking). Call net_poll_connect() to check.
+ * Returns 0 on success (connection initiated), -1 on failure. */
+int net_start_connect(net_context_t *ctx, uint16_t port);
+
+/* Poll for TCP connection establishment.
+ * Returns: 1 = connected, 0 = still waiting, -1 = error/refused. */
+int net_poll_connect(net_context_t *ctx);
+
+/* Finalize connection setup (set rx buffer, state = CONNECTED).
+ * Call once after net_poll_connect() returns 1. */
+void net_finish_connect(net_context_t *ctx);
+
 #endif /* RETROSURF_NETWORK_H */
