@@ -915,7 +915,7 @@ class RetroSurfServer:
         yt_state['pipeline'] = pipeline
         yt_state['paused'] = False
         yt_state['stopping'] = False
-        yt_state['client_audio_ms'] = 0
+        yt_state['client_audio_ms'] = 1000  # No ACKs — assume healthy buffer
         yt_state['client_frame_num'] = 0xFFFF
         yt_state['last_ack_time'] = time.monotonic()
         session.yt_ack_event.set()  # allow first frame
@@ -1007,14 +1007,11 @@ class RetroSurfServer:
                           f"{5 * audio_per_frame} audio samples "
                           f"(~{5 * audio_per_frame * 1000 // handler.audio_rate}ms)")
 
-            while handler.is_running() and not yt_state.get('stopping'):
-                # Wait for ACK from client
-                try:
-                    await asyncio.wait_for(yt_ack_event.wait(), timeout=5.0)
-                except asyncio.TimeoutError:
-                    print("[YouTube] ACK timeout, continuing")
-                yt_ack_event.clear()
+            # No ACK gating — just stream at steady FPS.
+            # TCP flow control handles backpressure if client is slow.
+            frame_interval = 1.0 / handler.fps
 
+            while handler.is_running() and not yt_state.get('stopping'):
                 # Handle pause
                 while yt_state.get('paused') and not yt_state.get('stopping'):
                     await asyncio.sleep(0.1)
@@ -1069,11 +1066,14 @@ class RetroSurfServer:
                           f"{actual_fps:.1f} FPS, "
                           f"audio buf {client_ms}ms")
 
-                # Pace to target FPS
+                # Pace to target FPS (wall-clock).
+                # If behind schedule, reset timing — never burst.
                 target_time = start_time + frame_num / handler.fps
                 now = time.monotonic()
                 if target_time > now:
                     await asyncio.sleep(target_time - now)
+                elif now - target_time > frame_interval:
+                    start_time = now - (frame_num / handler.fps)
 
         except (ConnectionError, OSError):
             print("[YouTube] Client disconnected during playback")

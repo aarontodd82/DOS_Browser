@@ -13,7 +13,7 @@ DEFAULT_CONFIG = {
     'interaction_scan_interval_ms': 500,
     'status_update_interval_ms': 2000,
     # YouTube mode settings
-    'youtube_fps': 10,
+    'youtube_fps': 5,
     'youtube_width': 320,
     'youtube_height': 200,
     'yt_dlp_path': 'yt-dlp',

@@ -18,6 +18,7 @@
 #include <dpmi.h>
 #include <go32.h>
 #include <sys/farptr.h>
+#include <sys/nearptr.h>
 #include <tcp.h>
 
 #include "youtube.h"
@@ -43,12 +44,19 @@ typedef struct {
     /* Software framebuffer (320x200 in extended memory) */
     uint8_t  *framebuf;
 
+    /* Direct VGA pointer (nearptr) for delta block writes */
+    uint8_t  *vga_base;
+
+    /* Dirty block tracking — marks which blocks need VGA update */
+    uint8_t  dirty[YT_BLOCKS_X * YT_BLOCKS_Y];
+
     /* Audio state */
     int      has_audio;      /* Server indicated audio available */
     int      sb_available;   /* Sound Blaster detected */
     int      sb_started;     /* DMA playback running */
     uint32_t audio_msgs;     /* Debug: count of audio messages received */
     uint16_t last_frame_num; /* Last complete video frame_num (for ACK) */
+    clock_t  last_display;   /* Clock tick of last VGA frame display */
 } YTContext;
 
 /* ---- Palette setup (6x6x6 cube, same as main.c) ---- */
@@ -109,6 +117,36 @@ static void yt_flush_frame(YTContext *ctx)
 {
     /* Copy 64000 bytes from system RAM framebuffer to VGA */
     dosmemput(ctx->framebuf, YT_FRAMEBUF_SIZE, 0xA0000);
+}
+
+/* Copy only dirty blocks from framebuf to VGA, then clear dirty flags */
+static void yt_flush_dirty(YTContext *ctx)
+{
+    int bx, by, row;
+
+    if (ctx->vga_base) {
+        /* Fast path: nearptr direct copy */
+        for (by = 0; by < YT_BLOCKS_Y; by++) {
+            for (bx = 0; bx < YT_BLOCKS_X; bx++) {
+                if (ctx->dirty[by * YT_BLOCKS_X + bx]) {
+                    uint16_t off = (uint16_t)by * 8 * YT_VIDEO_W
+                                 + (uint16_t)bx * 8;
+                    uint8_t *src = ctx->framebuf + off;
+                    uint8_t *dst = ctx->vga_base + off;
+                    for (row = 0; row < YT_BLOCK_SIZE; row++) {
+                        memcpy(dst, src, YT_BLOCK_SIZE);
+                        src += YT_VIDEO_W;
+                        dst += YT_VIDEO_W;
+                    }
+                    ctx->dirty[by * YT_BLOCKS_X + bx] = 0;
+                }
+            }
+        }
+    } else {
+        /* Fallback: dosmemput full frame */
+        yt_flush_frame(ctx);
+        memset(ctx->dirty, 0, sizeof(ctx->dirty));
+    }
 }
 
 static void yt_draw_loading(YTContext *ctx)
@@ -224,13 +262,14 @@ static void yt_apply_frame_chunk(YTContext *yt, const uint8_t *payload,
         rle_decode(ptr, comp_size, block_temp, YT_BLOCK_PIXELS);
         ptr += comp_size;
 
-        /* Blit 8x8 block to framebuffer */
+        /* Blit 8x8 block to framebuffer only (VGA updated separately) */
         dst = yt->framebuf + (uint16_t)by * 8 * YT_VIDEO_W
               + (uint16_t)bx * 8;
         for (row = 0; row < YT_BLOCK_SIZE; row++) {
             memcpy(dst, block_temp + row * YT_BLOCK_SIZE, YT_BLOCK_SIZE);
             dst += YT_VIDEO_W;
         }
+        yt->dirty[(uint16_t)by * YT_BLOCKS_X + bx] = 1;
     }
 }
 
@@ -289,6 +328,13 @@ int run_youtube(Config *cfg, VideoConfig *vc, net_context_t *ctx,
     /* Switch to Mode 13h */
     video_set_mode_13h();
     yt_set_palette();
+
+    /* Enable near pointer for direct VGA writes (zero-overhead block blit) */
+    if (__djgpp_nearptr_enable()) {
+        yt.vga_base = (uint8_t *)(0xA0000 + __djgpp_conventional_base);
+    } else {
+        yt.vga_base = NULL;  /* fallback: use dosmemput flush */
+    }
 
     /* Show loading screen */
     yt_draw_loading(&yt);
@@ -353,96 +399,104 @@ int run_youtube(Config *cfg, VideoConfig *vc, net_context_t *ctx,
 
     yt.state = YT_STATE_PLAYING;
     yt.last_frame_num = 0xFFFF;  /* No frame received yet */
+    yt.last_display = clock();   /* Init display pacing clock */
 
     /* Clear framebuffer for first real frame */
     memset(yt.framebuf, 0, YT_FRAMEBUF_SIZE);
 
     /* === Main YouTube playback loop ===
-     * Process one message at a time. Pump audio after EVERY message.
-     * Send ACK after both audio and video messages so the server
-     * gets frequent buffer-level feedback for audio-priority sending. */
+     *
+     * ARCHITECTURE: Decode and display are DECOUPLED.
+     * - Decode: drain all available messages, write to framebuf only
+     * - Display: on a fixed timer, copy dirty blocks to VGA
+     *
+     * This makes display timing independent of network arrival timing.
+     * If frames queue up in TCP, they all decode to framebuf but only
+     * the latest pixels hit VGA at the next display tick. */
+    {
+    clock_t display_interval = CLOCKS_PER_SEC / yt.fps;
+
     while (!quit) {
-        int prev_recv_pos;
+        /* 1. Drain all available network messages into framebuf */
+        {
+        int draining = 1;
+        while (draining && !quit) {
+            int prev_recv_pos;
 
-        /* Poll network + pump audio */
-        net_poll();
-        if (yt.sb_started) sb_pump();
-
-        /* Try to receive a complete message */
-        rc = net_recv_message(ctx, &header, recv_buf, &payload_len);
-        if (rc < 0) { quit = 1; disconnected = 1; break; }
-
-        if (rc == 0) {
-            /* No complete message — retry if partial data in buffer */
-            if (ctx->recv_pos > 0) {
-                int retries = 0;
-                while (retries < 50) {
-                    net_poll();
-                    if (yt.sb_started) sb_pump();  /* ALWAYS pump */
-                    prev_recv_pos = ctx->recv_pos;
-                    rc = net_recv_message(ctx, &header, recv_buf,
-                                          &payload_len);
-                    if (rc != 0) break;
-                    if (ctx->recv_pos == prev_recv_pos)
-                        retries++;
-                    else
-                        retries = 0;
-                }
-                if (rc < 0) { quit = 1; disconnected = 1; break; }
-                if (rc == 0) goto idle;
-            } else {
-                goto idle;
-            }
-        }
-
-        /* Process the received message */
-        switch (header.msg_type) {
-        case MSG_YT_FRAME:
-            yt_apply_frame_chunk(&yt, recv_buf, payload_len);
-            if (!(header.flags & FLAG_CONTINUED)) {
-                /* Complete frame — flush to VGA and ACK */
-                yt_flush_frame(&yt);
-                yt_send_ack(ctx,
-                    yt.sb_available ? sb_buffer_ms() : 0,
-                    yt.last_frame_num);
-                net_poll();
-            }
-            break;
-
-        case MSG_YT_AUDIO:
-            yt_handle_audio(&yt, recv_buf, payload_len);
-            /* ACK after audio too — gives server buffer feedback */
-            yt_send_ack(ctx,
-                yt.sb_available ? sb_buffer_ms() : 0,
-                yt.last_frame_num);
             net_poll();
-            break;
+            if (yt.sb_started) sb_pump();
 
-        case MSG_YT_EOF:
-            yt.state = YT_STATE_ENDED;
-            quit = 1;
-            break;
+            rc = net_recv_message(ctx, &header, recv_buf, &payload_len);
+            if (rc < 0) { quit = 1; disconnected = 1; break; }
 
-        case MSG_MODE_SWITCH:
-            if (payload_len >= 1 && recv_buf[0] != 2) {
-                quit = 1;
+            if (rc == 0) {
+                /* Partial message — pump and retry briefly */
+                if (ctx->recv_pos > 0) {
+                    int retries = 0;
+                    while (retries < 50) {
+                        net_poll();
+                        if (yt.sb_started) sb_pump();
+                        prev_recv_pos = ctx->recv_pos;
+                        rc = net_recv_message(ctx, &header, recv_buf,
+                                              &payload_len);
+                        if (rc != 0) break;
+                        if (ctx->recv_pos == prev_recv_pos)
+                            retries++;
+                        else
+                            retries = 0;
+                    }
+                    if (rc < 0) { quit = 1; disconnected = 1; break; }
+                    if (rc == 0) { draining = 0; break; }
+                } else {
+                    draining = 0;
+                    break;
+                }
             }
-            break;
 
-        case MSG_PALETTE:
-            video_set_palette(recv_buf, payload_len / 3);
-            break;
+            /* Process message — decode only, no VGA writes */
+            switch (header.msg_type) {
+            case MSG_YT_FRAME:
+                yt_apply_frame_chunk(&yt, recv_buf, payload_len);
+                break;
 
-        default:
-            break;
+            case MSG_YT_AUDIO:
+                yt_handle_audio(&yt, recv_buf, payload_len);
+                break;
+
+            case MSG_YT_EOF:
+                yt.state = YT_STATE_ENDED;
+                quit = 1;
+                break;
+
+            case MSG_MODE_SWITCH:
+                if (payload_len >= 1 && recv_buf[0] != 2)
+                    quit = 1;
+                break;
+
+            case MSG_PALETTE:
+                video_set_palette(recv_buf, payload_len / 3);
+                break;
+
+            default:
+                break;
+            }
+
+            if (yt.sb_started) sb_pump();
+        }
         }
 
-        /* Pump after every message */
-        if (yt.sb_started) sb_pump();
-        continue;
+        if (quit) break;
 
-    idle:
-        /* No data — handle keyboard and idle */
+        /* 2. Display: flush dirty blocks to VGA at fixed frame rate */
+        {
+            clock_t now = clock();
+            if (now - yt.last_display >= display_interval) {
+                yt_flush_dirty(&yt);
+                yt.last_display = now;
+            }
+        }
+
+        /* 3. Handle keyboard */
         {
             KeyEvent key;
             while (input_poll_key(&key)) {
@@ -474,17 +528,10 @@ int run_youtube(Config *cfg, VideoConfig *vc, net_context_t *ctx,
             }
         }
 
-        /* Pump audio + poll during idle */
+        /* 4. Pump audio + poll between cycles */
         if (yt.sb_started) sb_pump();
         net_poll();
-        {
-            int i;
-            for (i = 0; i < 3; i++) {
-                net_poll();
-                if (yt.sb_started) sb_pump();
-                if (net_data_ready()) break;
-            }
-        }
+    }
     }
 
 cleanup:
@@ -492,6 +539,12 @@ cleanup:
     if (yt.sb_started) {
         sb_stop();
         yt.sb_started = 0;
+    }
+
+    /* Disable near pointer access */
+    if (yt.vga_base) {
+        __djgpp_nearptr_disable();
+        yt.vga_base = NULL;
     }
 
     /* Free framebuffer */
