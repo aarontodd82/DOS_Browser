@@ -35,7 +35,7 @@ class YouTubeHandler:
             config.get('ffmpeg_path', 'ffmpeg'), 'ffmpeg')
         self.width = config.get('youtube_width', 320)
         self.height = config.get('youtube_height', 200)
-        self.fps = config.get('youtube_fps', 10)
+        self.fps = config.get('youtube_max_fps', 15)
         self.audio_rate = 11025
 
         self.stream_url = None

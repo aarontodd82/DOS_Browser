@@ -401,59 +401,34 @@ int run_youtube(Config *cfg, VideoConfig *vc, net_context_t *ctx,
     yt.last_frame_num = 0xFFFF;  /* No frame received yet */
     yt.last_display = clock();   /* Init display pacing clock */
 
-    /* Clear framebuffer for first real frame */
+    /* Clear framebuffer and force full VGA clear (remove debug text) */
     memset(yt.framebuf, 0, YT_FRAMEBUF_SIZE);
+    memset(yt.dirty, 1, sizeof(yt.dirty));
 
     /* === Main YouTube playback loop ===
      *
      * ARCHITECTURE: Decode and display are DECOUPLED.
-     * - Decode: drain all available messages, write to framebuf only
-     * - Display: on a fixed timer, copy dirty blocks to VGA
+     * - Each iteration: receive ONE message, decode to framebuf only
+     * - Display tick: on a fixed timer, copy dirty blocks to VGA
      *
-     * This makes display timing independent of network arrival timing.
-     * If frames queue up in TCP, they all decode to framebuf but only
-     * the latest pixels hit VGA at the next display tick. */
+     * The display tick is checked after EVERY message. This guarantees
+     * VGA updates happen on time even when messages arrive continuously.
+     * If the server sends faster than the display rate, frames silently
+     * overwrite each other in the framebuf — only the latest is shown. */
     {
     clock_t display_interval = CLOCKS_PER_SEC / yt.fps;
 
     while (!quit) {
-        /* 1. Drain all available network messages into framebuf */
-        {
-        int draining = 1;
-        while (draining && !quit) {
-            int prev_recv_pos;
+        /* 1. Network + audio pump */
+        net_poll();
+        if (yt.sb_started) sb_pump();
 
-            net_poll();
-            if (yt.sb_started) sb_pump();
+        /* 2. Try to receive ONE complete message */
+        rc = net_recv_message(ctx, &header, recv_buf, &payload_len);
+        if (rc < 0) { quit = 1; disconnected = 1; break; }
 
-            rc = net_recv_message(ctx, &header, recv_buf, &payload_len);
-            if (rc < 0) { quit = 1; disconnected = 1; break; }
-
-            if (rc == 0) {
-                /* Partial message — pump and retry briefly */
-                if (ctx->recv_pos > 0) {
-                    int retries = 0;
-                    while (retries < 50) {
-                        net_poll();
-                        if (yt.sb_started) sb_pump();
-                        prev_recv_pos = ctx->recv_pos;
-                        rc = net_recv_message(ctx, &header, recv_buf,
-                                              &payload_len);
-                        if (rc != 0) break;
-                        if (ctx->recv_pos == prev_recv_pos)
-                            retries++;
-                        else
-                            retries = 0;
-                    }
-                    if (rc < 0) { quit = 1; disconnected = 1; break; }
-                    if (rc == 0) { draining = 0; break; }
-                } else {
-                    draining = 0;
-                    break;
-                }
-            }
-
-            /* Process message — decode only, no VGA writes */
+        if (rc == 1) {
+            /* Got a complete message — decode to framebuf */
             switch (header.msg_type) {
             case MSG_YT_FRAME:
                 yt_apply_frame_chunk(&yt, recv_buf, payload_len);
@@ -480,14 +455,9 @@ int run_youtube(Config *cfg, VideoConfig *vc, net_context_t *ctx,
             default:
                 break;
             }
-
-            if (yt.sb_started) sb_pump();
-        }
         }
 
-        if (quit) break;
-
-        /* 2. Display: flush dirty blocks to VGA at fixed frame rate */
+        /* 3. Display tick — flush dirty blocks to VGA at fixed rate */
         {
             clock_t now = clock();
             if (now - yt.last_display >= display_interval) {
@@ -496,7 +466,7 @@ int run_youtube(Config *cfg, VideoConfig *vc, net_context_t *ctx,
             }
         }
 
-        /* 3. Handle keyboard */
+        /* 4. Handle keyboard */
         {
             KeyEvent key;
             while (input_poll_key(&key)) {
@@ -528,9 +498,8 @@ int run_youtube(Config *cfg, VideoConfig *vc, net_context_t *ctx,
             }
         }
 
-        /* 4. Pump audio + poll between cycles */
+        /* 5. Pump audio */
         if (yt.sb_started) sb_pump();
-        net_poll();
     }
     }
 

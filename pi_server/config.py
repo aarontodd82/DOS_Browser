@@ -13,7 +13,9 @@ DEFAULT_CONFIG = {
     'interaction_scan_interval_ms': 500,
     'status_update_interval_ms': 2000,
     # YouTube mode settings
-    'youtube_fps': 5,
+    'youtube_max_fps': 15,         # Upper FPS limit (simple scenes)
+    'youtube_min_fps': 3,          # Lower FPS limit (complex scenes)
+    'youtube_target_kbps': 500,    # Target bandwidth in KB/s (tune for NE2000)
     'youtube_width': 320,
     'youtube_height': 200,
     'yt_dlp_path': 'yt-dlp',

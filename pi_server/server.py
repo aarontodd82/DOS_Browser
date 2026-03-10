@@ -968,33 +968,40 @@ class RetroSurfServer:
     async def _youtube_loop(self, writer, session, seq):
         """Stream video frames and audio from ffmpeg to the DOS client.
 
-        Simple single-loop design: one audio chunk + one video frame per
-        iteration, paced to real-time FPS. Audio chunk size = audio_rate/fps
-        so audio production exactly matches DMA consumption rate.
+        Dynamic bandwidth-paced: FPS adapts to frame complexity.
+        Simple scenes (few changed blocks) → high FPS.
+        Complex scenes (everything moving) → lower FPS.
+        Always stays within the target bandwidth for the NE2000.
 
-        Extra audio is sent when the client reports low buffer level.
+        Audio chunk size scales with the frame interval so DMA
+        consumption rate always matches production rate.
         """
         yt_state = session.yt_state
-        yt_ack_event = session.yt_ack_event
         handler = yt_state['handler']
         pipeline = yt_state['pipeline']
         has_audio = handler.has_audio()
 
-        # Audio chunk = exactly one frame's worth of audio samples.
-        # At 11025 Hz / 10 fps = 1102 bytes/frame = 11020 bytes/sec,
-        # which matches the DMA consumption rate almost exactly.
-        audio_per_frame = (int(handler.audio_rate / handler.fps)
-                           if has_audio else 0)
+        # Bandwidth budget — the key tunable
+        target_bps = self.config.get('youtube_target_kbps', 200) * 1000
+        max_fps = self.config.get('youtube_max_fps', 15)
+        min_fps = self.config.get('youtube_min_fps', 3)
+        min_interval = 1.0 / max_fps
+        max_interval = 1.0 / min_fps
+
+        # Effective bandwidth available for video (subtract audio rate)
+        audio_rate = handler.audio_rate if has_audio else 0
+        video_budget_bps = max(target_bps - audio_rate, 50000)
 
         frame_num = 0
-        start_time = time.monotonic()
         frames_sent = 0
 
         try:
-            # Pre-buffer: send 5 audio chunks (~500ms at 11025/10)
+            # Pre-buffer: ~500ms of audio
             if has_audio:
+                prebuf_samples = int(handler.audio_rate * 0.5)
+                prebuf_chunk = prebuf_samples // 5
                 for i in range(5):
-                    audio_data = await handler.read_audio(audio_per_frame)
+                    audio_data = await handler.read_audio(prebuf_chunk)
                     if audio_data:
                         payload = encode_yt_audio(0, audio_data)
                         await self._send_message(
@@ -1003,43 +1010,23 @@ class RetroSurfServer:
                         has_audio = False
                         break
                 if has_audio:
-                    print(f"[YouTube] Pre-buffered "
-                          f"{5 * audio_per_frame} audio samples "
-                          f"(~{5 * audio_per_frame * 1000 // handler.audio_rate}ms)")
+                    print(f"[YouTube] Pre-buffered ~500ms audio")
 
-            # No ACK gating — just stream at steady FPS.
-            # TCP flow control handles backpressure if client is slow.
-            frame_interval = 1.0 / handler.fps
+            # Set timing references AFTER pre-buffer so frame 0
+            # aligns with the start of pre-buffered audio
+            start_time = time.monotonic()
+            last_send_time = time.monotonic()
+            last_audio_time = time.monotonic()
 
             while handler.is_running() and not yt_state.get('stopping'):
                 # Handle pause
                 while yt_state.get('paused') and not yt_state.get('stopping'):
                     await asyncio.sleep(0.1)
-                    start_time += 0.1
+                    last_send_time = time.monotonic()
+                    last_audio_time = time.monotonic()
 
                 if yt_state.get('stopping'):
                     break
-
-                timestamp_ms = int(frame_num * 1000 / handler.fps)
-
-                # Send audio chunk for this frame interval
-                if has_audio:
-                    audio_data = await handler.read_audio(audio_per_frame)
-                    if audio_data:
-                        payload = encode_yt_audio(timestamp_ms, audio_data)
-                        await self._send_message(
-                            writer, MSG_YT_AUDIO, payload, seq)
-                    else:
-                        has_audio = False
-
-                    # Send extra audio if client buffer is low
-                    client_ms = yt_state.get('client_audio_ms', 500)
-                    if client_ms < 400 and has_audio:
-                        extra = await handler.read_audio(audio_per_frame)
-                        if extra:
-                            payload = encode_yt_audio(timestamp_ms, extra)
-                            await self._send_message(
-                                writer, MSG_YT_AUDIO, payload, seq)
 
                 # Read next video frame from ffmpeg
                 rgb_data = await handler.read_video_frame()
@@ -1047,33 +1034,79 @@ class RetroSurfServer:
                     await self._send_message(writer, MSG_YT_EOF, b'', seq)
                     print(f"[YouTube] EOF after {frames_sent} frames")
                     break
+                frame_num += 1
 
-                # Process through dither pipeline
+                # FRAME SKIP: if we've fallen behind real-time, drain
+                # the ffmpeg pipe until we catch up. Without this, the
+                # video pipe buffers old frames while audio stays current.
+                elapsed = time.monotonic() - start_time
+                target_frame = int(elapsed * handler.fps)
+                skipped = 0
+                while frame_num < target_frame and skipped < handler.fps:
+                    skip = await handler.read_video_frame()
+                    if skip is None:
+                        rgb_data = None
+                        break
+                    rgb_data = skip  # keep the latest
+                    frame_num += 1
+                    skipped += 1
+                if rgb_data is None:
+                    await self._send_message(writer, MSG_YT_EOF, b'', seq)
+                    print(f"[YouTube] EOF after {frames_sent} frames")
+                    break
+                if skipped > 0:
+                    print(f"[YouTube] Skipped {skipped} frames to stay in sync")
+
                 blocks = pipeline.process_frame(rgb_data)
 
-                # Encode and send video frame
+                # Calculate frame data size
+                video_bytes = sum(len(rle) + 4
+                                  for _, _, rle in blocks) + 10
+
+                # Dynamic interval: larger frames → longer interval
+                interval = video_bytes / video_budget_bps
+                interval = max(min_interval, min(max_interval, interval))
+
+                # Read audio based on ACTUAL elapsed time since last audio
+                # send — NOT the computed interval. This prevents audio
+                # starvation when frame skipping or processing takes longer
+                # than expected.
+                timestamp_ms = int((time.monotonic() - start_time) * 1000)
+                if has_audio:
+                    now = time.monotonic()
+                    actual_elapsed = now - last_audio_time
+                    audio_samples = int(actual_elapsed * handler.audio_rate)
+                    if audio_samples > 0:
+                        audio_data = await handler.read_audio(audio_samples)
+                        if audio_data:
+                            payload = encode_yt_audio(timestamp_ms, audio_data)
+                            await self._send_message(
+                                writer, MSG_YT_AUDIO, payload, seq)
+                            last_audio_time = now
+                        else:
+                            has_audio = False
+
+                # Send video frame
                 await self._send_yt_frame(writer, seq, frame_num,
                                           timestamp_ms, blocks)
 
-                frame_num += 1
                 frames_sent += 1
 
                 if frames_sent % 100 == 0:
                     elapsed = time.monotonic() - start_time
                     actual_fps = frames_sent / elapsed if elapsed > 0 else 0
-                    client_ms = yt_state.get('client_audio_ms', 0)
+                    cur_fps = 1.0 / interval if interval > 0 else 0
                     print(f"[YouTube] {frames_sent} frames, "
-                          f"{actual_fps:.1f} FPS, "
-                          f"audio buf {client_ms}ms")
+                          f"avg {actual_fps:.1f} FPS, "
+                          f"cur {cur_fps:.1f} FPS, "
+                          f"{video_bytes}B/frame")
 
-                # Pace to target FPS (wall-clock).
-                # If behind schedule, reset timing — never burst.
-                target_time = start_time + frame_num / handler.fps
+                # Pace: sleep until interval elapses since last send
+                next_send = last_send_time + interval
                 now = time.monotonic()
-                if target_time > now:
-                    await asyncio.sleep(target_time - now)
-                elif now - target_time > frame_interval:
-                    start_time = now - (frame_num / handler.fps)
+                if next_send > now:
+                    await asyncio.sleep(next_send - now)
+                last_send_time = time.monotonic()
 
         except (ConnectionError, OSError):
             print("[YouTube] Client disconnected during playback")
