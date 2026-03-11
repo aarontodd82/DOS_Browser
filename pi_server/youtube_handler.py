@@ -41,6 +41,8 @@ class YouTubeHandler:
         self.stream_url = None
         self.title = 'Unknown'
         self.duration = 0
+        self.source_width = 0
+        self.source_height = 0
 
         self._video_proc = None
         self._audio_proc = None
@@ -88,20 +90,77 @@ class YouTubeHandler:
         self.stream_url = info.get('url', '')
         self.title = (info.get('title', 'Unknown') or 'Unknown')[:79]
         self.duration = int(info.get('duration') or 0)
+        self.source_width = int(info.get('width') or 0)
+        self.source_height = int(info.get('height') or 0)
 
         if not self.stream_url:
             raise RuntimeError("yt-dlp returned no stream URL")
 
         print(f"[YouTube] Title: {self.title}")
-        print(f"[YouTube] Duration: {self.duration}s")
+        print(f"[YouTube] Duration: {self.duration}s, "
+              f"Source: {self.source_width}x{self.source_height}")
         print(f"[YouTube] Stream URL obtained ({len(self.stream_url)} chars)")
 
+    async def _detect_crop(self):
+        """Detect baked-in black bars using ffmpeg cropdetect.
+
+        Many YouTube videos have black bars baked into the video
+        (e.g., 4:3 content in a 16:9 container). This runs a quick
+        pre-pass to find the actual content area.
+        """
+        null_target = 'NUL' if sys.platform == 'win32' else '/dev/null'
+        proc = await asyncio.create_subprocess_exec(
+            self.ffmpeg_path,
+            '-ss', '3',
+            '-i', self.stream_url,
+            '-vf', 'cropdetect=24:2:0',
+            '-frames:v', '15',
+            '-f', 'null',
+            null_target,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await proc.communicate()
+
+        crops = re.findall(r'crop=(\d+):(\d+):(\d+):(\d+)',
+                           stderr.decode(errors='replace'))
+        if crops:
+            cw, ch, cx, cy = [int(x) for x in crops[-1]]
+            # Only crop if bars are meaningful (>= 16px removed total)
+            horiz_removed = self.source_width - cw if self.source_width else 0
+            vert_removed = self.source_height - ch if self.source_height else 0
+            if (horiz_removed >= 16 or vert_removed >= 16) and cw > 0 and ch > 0:
+                print(f"[YouTube] Crop detected: {cw}x{ch}+{cx}+{cy} "
+                      f"(removed {horiz_removed}x{vert_removed} black bars)")
+                return cw, ch, cx, cy
+
+        print("[YouTube] No significant black bars detected")
+        return None
+
     async def start_video(self):
-        """Start ffmpeg to decode video and output raw RGB24 frames."""
+        """Start ffmpeg to decode video and output raw RGB24 frames.
+
+        Mode 13h (320x200) has non-square pixels on a 4:3 monitor.
+        Pixel aspect ratio is 5:6 (pixels are taller than wide).
+        We detect baked-in black bars, compute scale dimensions that
+        will look correct on the CRT, then letterbox — never crop
+        actual content.
+        """
         w, h, fps = self.width, self.height, self.fps
 
-        vf = (f'scale={w}:{h}:'
-              f'force_original_aspect_ratio=decrease,'
+        # Detect baked-in black bars (e.g., 4:3 in 16:9 container)
+        crop_filter = ''
+        crop = await self._detect_crop()
+        if crop:
+            cw, ch, cx, cy = crop
+            crop_filter = f'crop={cw}:{ch}:{cx}:{cy},'
+
+        # Scale to fit within 320x200, preserving aspect ratio.
+        # No PAR correction — at 320px wide the distortion from
+        # Mode 13h's non-square pixels is imperceptible, and
+        # skipping it saves bandwidth on constrained hardware.
+        vf = (f'{crop_filter}'
+              f'scale={w}:{h}:force_original_aspect_ratio=decrease,'
               f'pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=black')
 
         self._video_proc = await asyncio.create_subprocess_exec(
@@ -116,7 +175,8 @@ class YouTubeHandler:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        print(f"[YouTube] Video ffmpeg started ({w}x{h} @ {fps} FPS)")
+        print(f"[YouTube] Video ffmpeg started "
+              f"({crop_filter or 'no crop'} → {w}x{h} @ {fps} FPS)")
 
     async def start_audio(self):
         """Start ffmpeg to extract audio as 8-bit unsigned mono PCM.
