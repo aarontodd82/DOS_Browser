@@ -148,12 +148,11 @@ class YouTubeHandler:
         """
         w, h, fps = self.width, self.height, self.fps
 
-        # Detect baked-in black bars (e.g., 4:3 in 16:9 container)
+        # Crop detection disabled — black bars are "free" bandwidth
+        # (delta detection skips unchanged blocks, so bars cost nothing
+        # after the first frame, while cropping them adds more changing
+        # content pixels that increase per-frame size).
         crop_filter = ''
-        crop = await self._detect_crop()
-        if crop:
-            cw, ch, cx, cy = crop
-            crop_filter = f'crop={cw}:{ch}:{cx}:{cy},'
 
         # Scale to fit within 320x200, preserving aspect ratio.
         # No PAR correction — at 320px wide the distortion from
