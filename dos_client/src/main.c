@@ -428,12 +428,10 @@ static int run_browser(Config *cfg, VideoConfig *vc, net_context_t *passed_ctx)
             video_fill_rect(vc, 0, vc->chrome_height,
                             vc->content_width, vc->content_height, 0);
             scrollbar_draw(&scrollbar, vc);
-            chrome_set_status(&chrome, "Loading...");
+            chrome_set_status(&chrome, "Returning to page...");
             chrome_draw_status(&chrome, vc);
             video_flush_full(vc);
-            /* Force server to send a fresh frame by reloading the page.
-             * The push_loop may be stuck in idle after YouTube mode. */
-            send_nav_action(&ctx, NAV_RELOAD);
+            /* Server handles returning to the previous page now. */
             continue;  /* restart main loop */
         }
 

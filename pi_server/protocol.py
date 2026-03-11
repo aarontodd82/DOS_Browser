@@ -70,6 +70,7 @@ YT_ACTION_RESUME = 1
 YT_ACTION_SEEK_FWD = 2
 YT_ACTION_SEEK_BACK = 3
 YT_ACTION_STOP = 4
+YT_ACTION_SEEK = 5
 
 # --- Nav Actions ---
 NAV_BACK = 0
@@ -542,7 +543,10 @@ def encode_yt_frame_chunk(frame_num, timestamp_ms, blocks):
 
 def decode_yt_control(data):
     """Decode MSG_YT_CONTROL payload."""
-    return {'action': data[0]}
+    result = {'action': data[0]}
+    if data[0] == YT_ACTION_SEEK and len(data) >= 5:
+        result['seek_ms'] = struct.unpack_from('<I', data, 1)[0]
+    return result
 
 
 def decode_yt_ack(data):

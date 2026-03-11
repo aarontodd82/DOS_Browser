@@ -57,6 +57,9 @@ typedef struct {
     uint32_t audio_msgs;     /* Debug: count of audio messages received */
     uint16_t last_frame_num; /* Last complete video frame_num (for ACK) */
     clock_t  last_display;   /* Clock tick of last VGA frame display */
+
+    /* Progress bar layout (computed by yt_draw_ui, used by mouse click) */
+    int      track_x1, track_x2;
 } YTContext;
 
 /* ---- Palette setup (6x6x6 cube, same as main.c) ---- */
@@ -109,6 +112,80 @@ static void yt_set_palette(void)
     pal[255*3+0] = 255; pal[255*3+1] =   0; pal[255*3+2] = 255;
 
     video_set_palette(pal, 256);
+}
+
+/* Palette indices for UI (also used by cursor) */
+#define UI_BLACK       0     /* 0,0,0 */
+#define UI_DARK_GRAY   216   /* grayscale ramp, ~dark gray */
+#define UI_RED         180   /* 5*36+0*6+0 = red (255,0,0) */
+#define UI_WHITE       215   /* 5*36+5*6+5 = white (255,255,255) */
+
+/* ---- Simple mouse cursor for Mode 13h ---- */
+
+/* 8x8 arrow cursor bitmap (1=white, 2=black outline, 0=transparent) */
+static const uint8_t yt_cursor[8][8] = {
+    {2,0,0,0,0,0,0,0},
+    {2,2,0,0,0,0,0,0},
+    {2,1,2,0,0,0,0,0},
+    {2,1,1,2,0,0,0,0},
+    {2,1,1,1,2,0,0,0},
+    {2,1,1,1,1,2,0,0},
+    {2,1,2,2,0,0,0,0},
+    {2,0,0,2,0,0,0,0},
+};
+
+/* Save-under buffer for cursor restore */
+static uint8_t yt_cursor_save[8 * 8];
+static int yt_cursor_saved_x = -1, yt_cursor_saved_y = -1;
+
+static void yt_cursor_restore(YTContext *ctx)
+{
+    int row, cx, cy;
+    if (yt_cursor_saved_x < 0) return;
+    cx = yt_cursor_saved_x;
+    cy = yt_cursor_saved_y;
+    for (row = 0; row < 8; row++) {
+        int y = cy + row;
+        if (y >= 0 && y < YT_VIDEO_H) {
+            memcpy(ctx->framebuf + y * YT_VIDEO_W + cx,
+                   yt_cursor_save + row * 8, 8);
+        }
+    }
+}
+
+static void yt_cursor_draw(YTContext *ctx, int mx, int my)
+{
+    int row, col;
+    /* Clamp position */
+    if (mx > YT_VIDEO_W - 8) mx = YT_VIDEO_W - 8;
+    if (my > YT_VIDEO_H - 8) my = YT_VIDEO_H - 8;
+    if (mx < 0) mx = 0;
+    if (my < 0) my = 0;
+
+    /* Save under */
+    for (row = 0; row < 8; row++) {
+        int y = my + row;
+        if (y >= 0 && y < YT_VIDEO_H) {
+            memcpy(yt_cursor_save + row * 8,
+                   ctx->framebuf + y * YT_VIDEO_W + mx, 8);
+        }
+    }
+    yt_cursor_saved_x = mx;
+    yt_cursor_saved_y = my;
+
+    /* Draw cursor */
+    for (row = 0; row < 8; row++) {
+        int y = my + row;
+        if (y < 0 || y >= YT_VIDEO_H) continue;
+        for (col = 0; col < 8; col++) {
+            int x = mx + col;
+            if (x < 0 || x >= YT_VIDEO_W) continue;
+            if (yt_cursor[row][col] == 1)
+                ctx->framebuf[y * YT_VIDEO_W + x] = UI_WHITE;
+            else if (yt_cursor[row][col] == 2)
+                ctx->framebuf[y * YT_VIDEO_W + x] = UI_BLACK;
+        }
+    }
 }
 
 /* ---- VGA Mode 13h helpers ---- */
@@ -166,6 +243,164 @@ static void yt_draw_loading(YTContext *ctx)
     yt_flush_frame(ctx);
 }
 
+/* ---- Format time as "M:SS" or "H:MM:SS" ---- */
+
+static void yt_format_time(uint32_t ms, char *buf, int bufsize)
+{
+    uint32_t total_sec = ms / 1000;
+    uint32_t h = total_sec / 3600;
+    uint32_t m = (total_sec % 3600) / 60;
+    uint32_t s = total_sec % 60;
+
+    if (h > 0) {
+        sprintf(buf, "%lu:%02lu:%02lu", (unsigned long)h,
+                (unsigned long)m, (unsigned long)s);
+    } else {
+        sprintf(buf, "%lu:%02lu", (unsigned long)m, (unsigned long)s);
+    }
+    (void)bufsize;
+}
+
+/* ---- Player UI overlay (bottom 12 pixels, y=188..199) ---- */
+
+static void yt_draw_ui(YTContext *yt)
+{
+    char elapsed_buf[16], total_buf[16];
+    int elapsed_w, total_w;
+    int track_x1, track_x2, track_w, fill_w;
+    int bar_y = 190;
+    int bar_h = 6;
+    int x, row;
+
+    /* Format elapsed and total time */
+    yt_format_time(yt->current_ms, elapsed_buf, sizeof(elapsed_buf));
+    yt_format_time(yt->duration_ms, total_buf, sizeof(total_buf));
+
+    elapsed_w = font_string_width(elapsed_buf, FONT_SMALL);
+    total_w = font_string_width(total_buf, FONT_SMALL);
+
+    /* 2px separator line at y=188..189 */
+    for (row = 188; row < 190; row++) {
+        memset(yt->framebuf + row * YT_VIDEO_W, UI_BLACK, YT_VIDEO_W);
+    }
+
+    /* Progress bar background (y=190..195) */
+    for (row = bar_y; row < bar_y + bar_h; row++) {
+        memset(yt->framebuf + row * YT_VIDEO_W, UI_BLACK, YT_VIDEO_W);
+    }
+
+    /* Elapsed time text at left */
+    font_draw_string(yt->framebuf, YT_VIDEO_W, 4, bar_y - 1,
+                     elapsed_buf, UI_WHITE, UI_BLACK, FONT_SMALL);
+
+    /* Total time text at right */
+    font_draw_string(yt->framebuf, YT_VIDEO_W, YT_VIDEO_W - total_w - 4,
+                     bar_y - 1, total_buf, UI_WHITE, UI_BLACK, FONT_SMALL);
+
+    /* Progress bar track between text labels */
+    track_x1 = 4 + elapsed_w + 4;
+    track_x2 = YT_VIDEO_W - total_w - 8;
+    track_w = track_x2 - track_x1;
+
+    /* Save for mouse click hit testing */
+    yt->track_x1 = track_x1;
+    yt->track_x2 = track_x2;
+
+    if (track_w > 10 && yt->duration_ms > 0) {
+        /* Dark gray track background */
+        for (row = bar_y + 1; row < bar_y + bar_h - 1; row++) {
+            memset(yt->framebuf + row * YT_VIDEO_W + track_x1,
+                   UI_DARK_GRAY, track_w);
+        }
+
+        /* Red filled portion */
+        fill_w = (int)((uint32_t)yt->current_ms * (uint32_t)track_w
+                       / yt->duration_ms);
+        if (fill_w > track_w) fill_w = track_w;
+        if (fill_w > 0) {
+            for (row = bar_y + 1; row < bar_y + bar_h - 1; row++) {
+                memset(yt->framebuf + row * YT_VIDEO_W + track_x1,
+                       UI_RED, fill_w);
+            }
+        }
+    }
+
+    /* Bottom area (y=196..199) black */
+    for (row = 196; row < 200; row++) {
+        memset(yt->framebuf + row * YT_VIDEO_W, UI_BLACK, YT_VIDEO_W);
+    }
+
+    /* Mark dirty blocks for rows y=184..199 (by=23 and by=24) */
+    for (x = 0; x < YT_BLOCKS_X; x++) {
+        yt->dirty[23 * YT_BLOCKS_X + x] = 1;
+        yt->dirty[24 * YT_BLOCKS_X + x] = 1;
+    }
+}
+
+static void yt_draw_pause(YTContext *yt)
+{
+    const char *text = "PAUSED";
+    int tw, th, bw, bh, bx, by, total_h;
+    int row;
+    int ttw = 0, tty = 0;
+
+    tw = font_string_width(text, FONT_MEDIUM);
+    th = font_char_height(FONT_MEDIUM);
+
+    /* Calculate total height including title */
+    total_h = th + 12;
+    if (yt->title[0]) {
+        ttw = font_string_width(yt->title, FONT_SMALL);
+        total_h += 4 + font_char_height(FONT_SMALL);
+    }
+
+    /* Width covers both "PAUSED" and title */
+    bw = tw + 16;
+    if (yt->title[0] && ttw + 16 > bw)
+        bw = ttw + 16;
+
+    bh = total_h;
+    bx = (YT_VIDEO_W - bw) / 2;
+    by = (180 - bh) / 2;  /* Center in video area above UI */
+
+    /* Dark rectangle background — covers BOTH text and title */
+    for (row = by; row < by + bh; row++) {
+        if (row >= 0 && row < 188)
+            memset(yt->framebuf + row * YT_VIDEO_W + bx, UI_BLACK, bw);
+    }
+
+    /* Draw "PAUSED" centered */
+    font_draw_string(yt->framebuf, YT_VIDEO_W,
+                     bx + (bw - tw) / 2, by + 6,
+                     text, UI_WHITE, UI_BLACK, FONT_MEDIUM);
+
+    /* Draw title below, also centered within the rectangle */
+    if (yt->title[0]) {
+        tty = by + th + 12;
+        if (tty + 8 < 188) {
+            font_draw_string(yt->framebuf, YT_VIDEO_W,
+                             bx + (bw - ttw) / 2, tty,
+                             yt->title, UI_WHITE, UI_BLACK, FONT_SMALL);
+        }
+    }
+
+    /* Mark affected blocks dirty */
+    {
+        int dbx1 = bx / YT_BLOCK_SIZE;
+        int dbx2 = (bx + bw + YT_BLOCK_SIZE - 1) / YT_BLOCK_SIZE;
+        int dby1 = by / YT_BLOCK_SIZE;
+        int dby2 = (by + bh + YT_BLOCK_SIZE - 1) / YT_BLOCK_SIZE;
+        int dx, dy;
+        if (dbx1 < 0) dbx1 = 0;
+        if (dbx2 > YT_BLOCKS_X) dbx2 = YT_BLOCKS_X;
+        if (dby1 < 0) dby1 = 0;
+        if (dby2 > YT_BLOCKS_Y) dby2 = YT_BLOCKS_Y;
+        for (dy = dby1; dy < dby2; dy++)
+            for (dx = dbx1; dx < dbx2; dx++)
+                yt->dirty[dy * YT_BLOCKS_X + dx] = 1;
+    }
+}
+
 /* ---- Protocol helpers ---- */
 
 static void yt_send_control(net_context_t *ctx, uint8_t action)
@@ -173,6 +408,17 @@ static void yt_send_control(net_context_t *ctx, uint8_t action)
     uint8_t buf[1];
     buf[0] = action;
     net_send_message(ctx, MSG_YT_CONTROL, buf, 1);
+}
+
+static void yt_send_seek(net_context_t *ctx, uint32_t target_ms)
+{
+    uint8_t buf[5];
+    buf[0] = YT_ACTION_SEEK;
+    buf[1] = (uint8_t)(target_ms & 0xFF);
+    buf[2] = (uint8_t)((target_ms >> 8) & 0xFF);
+    buf[3] = (uint8_t)((target_ms >> 16) & 0xFF);
+    buf[4] = (uint8_t)((target_ms >> 24) & 0xFF);
+    net_send_message(ctx, MSG_YT_CONTROL, buf, 5);
 }
 
 static void yt_send_ack(net_context_t *ctx, uint16_t audio_buffer_ms,
@@ -401,6 +647,20 @@ int run_youtube(Config *cfg, VideoConfig *vc, net_context_t *ctx,
     yt.last_frame_num = 0xFFFF;  /* No frame received yet */
     yt.last_display = clock();   /* Init display pacing clock */
 
+    /* Initialize mouse for Mode 13h.
+     * INT 33h always reports x in virtual pixels (0-639) in Mode 13h
+     * due to hardware pixel doubling. Set range to 640 and divide
+     * x by 2 when reading. Standard Mode 13h technique. */
+    input_init_mouse(YT_VIDEO_W * 2, YT_VIDEO_H);
+
+    /* Mouse state must persist across loop iterations to track
+     * button transitions (pressed → released). A local variable
+     * would re-init to zero each iteration, causing every held
+     * button poll to register as a new click. */
+    {
+    MouseState mouse;
+    memset(&mouse, 0, sizeof(mouse));
+
     /* Clear framebuffer and force full VGA clear (remove debug text) */
     memset(yt.framebuf, 0, YT_FRAMEBUF_SIZE);
     memset(yt.dirty, 1, sizeof(yt.dirty));
@@ -461,6 +721,36 @@ int run_youtube(Config *cfg, VideoConfig *vc, net_context_t *ctx,
         {
             clock_t now = clock();
             if (now - yt.last_display >= display_interval) {
+                /* Restore cursor save-under before drawing UI */
+                yt_cursor_restore(&yt);
+
+                /* Draw player UI overlay into framebuf */
+                yt_draw_ui(&yt);
+
+                /* Draw pause overlay if paused */
+                if (yt.state == YT_STATE_PAUSED) {
+                    yt_draw_pause(&yt);
+                }
+
+                /* Draw mouse cursor on top, mark its blocks dirty */
+                yt_cursor_draw(&yt, mouse.x / 2, mouse.y);
+                {
+                    int cbx = (mouse.x / 2) / YT_BLOCK_SIZE;
+                    int cby = mouse.y / YT_BLOCK_SIZE;
+                    int dx, dy;
+                    for (dy = cby; dy <= cby + 1 && dy < YT_BLOCKS_Y; dy++)
+                        for (dx = cbx; dx <= cbx + 1 && dx < YT_BLOCKS_X; dx++)
+                            yt.dirty[dy * YT_BLOCKS_X + dx] = 1;
+                    /* Also mark old cursor position dirty */
+                    if (yt_cursor_saved_x >= 0) {
+                        int obx = yt_cursor_saved_x / YT_BLOCK_SIZE;
+                        int oby = yt_cursor_saved_y / YT_BLOCK_SIZE;
+                        for (dy = oby; dy <= oby + 1 && dy < YT_BLOCKS_Y; dy++)
+                            for (dx = obx; dx <= obx + 1 && dx < YT_BLOCKS_X; dx++)
+                                yt.dirty[dy * YT_BLOCKS_X + dx] = 1;
+                    }
+                }
+
                 yt_flush_dirty(&yt);
                 yt.last_display = now;
             }
@@ -494,14 +784,75 @@ int run_youtube(Config *cfg, VideoConfig *vc, net_context_t *ctx,
                         yt_send_control(ctx, YT_ACTION_PAUSE);
                         yt.state = YT_STATE_PAUSED;
                     }
+                } else if (key.extended) {
+                    /* Arrow key seek */
+                    uint32_t seek_target = 0xFFFFFFFF;
+                    if (key.scancode == 0x4B) {
+                        /* Left arrow: seek back 10s */
+                        seek_target = 0;
+                        if (yt.current_ms > 10000)
+                            seek_target = yt.current_ms - 10000;
+                    } else if (key.scancode == 0x4D) {
+                        /* Right arrow: seek forward 10s */
+                        seek_target = yt.current_ms + 10000;
+                        if (seek_target > yt.duration_ms)
+                            seek_target = yt.duration_ms;
+                    }
+                    if (seek_target != 0xFFFFFFFF) {
+                        /* Flush stale audio before seek */
+                        if (yt.sb_started) {
+                            sb_stop();
+                            yt.sb_started = 0;
+                        }
+                        yt.audio_msgs = 0;
+                        yt_send_seek(ctx, seek_target);
+                    }
                 }
             }
         }
 
-        /* 5. Pump audio */
+        /* 5. Handle mouse — click on progress bar to seek */
+        {
+            input_poll_mouse(&mouse);
+            mouse.x /= 2;  /* Mode 13h: virtual pixels → screen pixels */
+            if (input_mouse_clicked(&mouse, 0)) {
+                if (mouse.y >= 188 && mouse.y < 200) {
+                    /* Click on progress bar area */
+                    if (mouse.x >= yt.track_x1 && mouse.x < yt.track_x2
+                        && yt.duration_ms > 0) {
+                        /* Seek to clicked position */
+                        uint32_t target_ms =
+                            (uint32_t)(mouse.x - yt.track_x1)
+                            * yt.duration_ms
+                            / (uint32_t)(yt.track_x2 - yt.track_x1);
+                        if (target_ms > yt.duration_ms)
+                            target_ms = yt.duration_ms;
+                        /* Flush stale audio before seek */
+                        if (yt.sb_started) {
+                            sb_stop();
+                            yt.sb_started = 0;
+                        }
+                        yt.audio_msgs = 0;
+                        yt_send_seek(ctx, target_ms);
+                    }
+                } else {
+                    /* Click anywhere else — toggle pause */
+                    if (yt.state == YT_STATE_PAUSED) {
+                        yt_send_control(ctx, YT_ACTION_RESUME);
+                        yt.state = YT_STATE_PLAYING;
+                    } else if (yt.state == YT_STATE_PLAYING) {
+                        yt_send_control(ctx, YT_ACTION_PAUSE);
+                        yt.state = YT_STATE_PAUSED;
+                    }
+                }
+            }
+        }
+
+        /* 6. Pump audio */
         if (yt.sb_started) sb_pump();
     }
-    }
+    }  /* end while + display_interval scope */
+    }  /* end mouse scope */
 
 cleanup:
     /* Stop audio playback */

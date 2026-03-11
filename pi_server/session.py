@@ -261,6 +261,7 @@ class BrowserSession:
         self._interaction_dirty = True
         self._last_scroll_y = 0
         self._nav_burst_until = 0
+        self._url_changed = False
 
         # Native rendering mode
         self.render_mode = 'screenshot'  # 'screenshot' or 'native'
@@ -348,6 +349,14 @@ class BrowserSession:
         self._dirty = True
         self._interaction_dirty = True
         self.is_loading = False
+        # Track URL changes for YouTube detection in push_loop
+        try:
+            new_url = self.page.url if self.page else ''
+            if new_url and new_url != self.current_url:
+                self.current_url = new_url
+                self._url_changed = True
+        except Exception:
+            pass
 
     def _on_domcontentloaded(self, _=None):
         self._dirty = True

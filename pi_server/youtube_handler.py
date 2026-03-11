@@ -13,8 +13,8 @@ import shutil
 import sys
 
 YOUTUBE_RE = re.compile(
-    r'(?:https?://)?(?:www\.|m\.)?'
-    r'(?:youtube\.com/(?:watch|shorts|embed)|youtu\.be/)',
+    r'(?:https?://)?(?:www\.|m\.|music\.)?'
+    r'(?:youtube\.com/(?:watch|shorts|embed|live|v/)|youtu\.be/)',
     re.IGNORECASE
 )
 
@@ -48,6 +48,7 @@ class YouTubeHandler:
         self._audio_proc = None
         self._audio_available = False
         self._frame_size = self.width * self.height * 3
+        self._seek_position = 0
 
     @staticmethod
     def _find_tool(configured_path, tool_name):
@@ -162,9 +163,14 @@ class YouTubeHandler:
               f'scale={w}:{h}:force_original_aspect_ratio=decrease,'
               f'pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=black')
 
+        # Build input args with optional seek position
+        input_args = ['-i', self.stream_url]
+        if self._seek_position > 0:
+            input_args = ['-ss', str(self._seek_position)] + input_args
+
         self._video_proc = await asyncio.create_subprocess_exec(
             self.ffmpeg_path,
-            '-i', self.stream_url,
+            *input_args,
             '-vf', vf,
             '-r', str(fps),
             '-pix_fmt', 'rgb24',
@@ -183,9 +189,14 @@ class YouTubeHandler:
         Uses the same stream URL as video. If the stream has no audio
         track, ffmpeg will exit immediately and has_audio() returns False.
         """
+        # Build input args with optional seek position
+        audio_input_args = ['-i', self.stream_url]
+        if self._seek_position > 0:
+            audio_input_args = ['-ss', str(self._seek_position)] + audio_input_args
+
         self._audio_proc = await asyncio.create_subprocess_exec(
             self.ffmpeg_path,
-            '-i', self.stream_url,
+            *audio_input_args,
             '-vn',
             '-ac', '1',
             '-ar', str(self.audio_rate),

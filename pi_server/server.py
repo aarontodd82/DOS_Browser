@@ -29,7 +29,7 @@ from protocol import (
     MSG_GLYPH_CACHE,
     MSG_YT_START, MSG_YT_FRAME, MSG_YT_AUDIO, MSG_YT_EOF,
     MSG_YT_CONTROL, MSG_YT_ACK,
-    YT_ACTION_PAUSE, YT_ACTION_RESUME, YT_ACTION_STOP,
+    YT_ACTION_PAUSE, YT_ACTION_RESUME, YT_ACTION_STOP, YT_ACTION_SEEK,
     NAV_BACK, NAV_FORWARD, NAV_RELOAD, NAV_STOP, NAV_TOGGLE_MODE,
     MOUSE_MOVE, MOUSE_CLICK, MOUSE_RELEASE, MOUSE_DBLCLICK,
     FLAG_CONTINUED,
@@ -318,6 +318,8 @@ class RetroSurfServer:
         last_capture_time = 0
         NAV_BURST_MIN_INTERVAL = 0.15  # 150ms between captures during page load
 
+        _yt_last_url = ''  # Track URL for YouTube auto-detection
+
         try:
          while True:
             # Wait for client ACK (or timeout as safety net)
@@ -330,6 +332,23 @@ class RetroSurfServer:
             if t_ack_got - t_ack_wait > 0.01:
                 print(f"[Timing] ACK wait: {(t_ack_got-t_ack_wait)*1000:.1f}ms")
             frame_ack_event.clear()
+
+            # Check if browser navigated to a YouTube page (runs in ALL
+            # modes). Compares page.url directly against our last-seen
+            # URL — cannot rely on _on_load because update_page_info()
+            # races with it and clears the change flag.
+            try:
+                _cur_url = session.page.url if session.page else ''
+            except Exception:
+                _cur_url = ''
+            if _cur_url and _cur_url != _yt_last_url:
+                _yt_last_url = _cur_url
+                from youtube_handler import is_youtube_url
+                if is_youtube_url(_cur_url):
+                    await self._start_youtube(
+                        writer, session, seq, _cur_url)
+                    empty_frames = 0
+                    continue
 
             # IDLE MODE: poll for dirty state before capturing
             if empty_frames >= IDLE_THRESHOLD:
@@ -594,8 +613,15 @@ class RetroSurfServer:
                 # Re-check complexity after navigation actions
                 if action in (NAV_BACK, NAV_FORWARD, NAV_RELOAD):
                     await asyncio.sleep(0.5)
-                    await self._check_and_send_native(
-                        writer, session, seq)
+                    # Check if navigated to a YouTube URL
+                    new_url = session.page.url
+                    from youtube_handler import is_youtube_url
+                    if is_youtube_url(new_url):
+                        await self._start_youtube(
+                            writer, session, seq, new_url)
+                    else:
+                        await self._check_and_send_native(
+                            writer, session, seq)
 
             elif msg_type == MSG_NATIVE_CLICK:
                 click = decode_native_click(payload)
@@ -608,13 +634,18 @@ class RetroSurfServer:
                         break
                 if href:
                     print(f"[Server] Native click: link {link_id} -> {href}")
-                    await session.navigate(href)
-                    status_text = await session.get_status_text()
-                    await self._send_message(writer, MSG_STATUS,
-                                             encode_status(status_text), seq)
-                    await asyncio.sleep(0.3)
-                    await self._check_and_send_native(
-                        writer, session, seq)
+                    from youtube_handler import is_youtube_url
+                    if is_youtube_url(href):
+                        await self._start_youtube(
+                            writer, session, seq, href)
+                    else:
+                        await session.navigate(href)
+                        status_text = await session.get_status_text()
+                        await self._send_message(writer, MSG_STATUS,
+                                                 encode_status(status_text), seq)
+                        await asyncio.sleep(0.3)
+                        await self._check_and_send_native(
+                            writer, session, seq)
                 else:
                     print(f"[Server] Native click: link {link_id} not found")
 
@@ -631,6 +662,10 @@ class RetroSurfServer:
                     elif action == YT_ACTION_RESUME:
                         session.yt_state['paused'] = False
                         print("[YouTube] Resumed")
+                    elif action == YT_ACTION_SEEK:
+                        seek_ms = ctrl.get('seek_ms', 0)
+                        session.yt_state['seek_to'] = seek_ms
+                        print(f"[YouTube] Seek requested to {seek_ms}ms")
 
             elif msg_type == MSG_YT_ACK:
                 ack = decode_yt_ack(payload)
@@ -908,6 +943,9 @@ class RetroSurfServer:
                                    handler.duration, handler.title)
         await self._send_message(writer, MSG_YT_START, yt_start, seq)
 
+        # Save URL to return to after video ends
+        return_url = session.page.url
+
         # Enter YouTube mode
         session.render_mode = 'youtube'
         yt_state = session.yt_state
@@ -915,6 +953,7 @@ class RetroSurfServer:
         yt_state['pipeline'] = pipeline
         yt_state['paused'] = False
         yt_state['stopping'] = False
+        yt_state['return_url'] = return_url
         yt_state['client_audio_ms'] = 1000  # No ACKs — assume healthy buffer
         yt_state['client_frame_num'] = 0xFFFF
         yt_state['last_ack_time'] = time.monotonic()
@@ -964,6 +1003,17 @@ class RetroSurfServer:
         await self._send_message(writer, MSG_MODE_SWITCH,
                                  encode_mode_switch(0), seq)
         print("[YouTube] Stopped, back to screenshot mode")
+
+        # Navigate back to the page the user was on before YouTube
+        from youtube_handler import is_youtube_url
+        return_url = yt_state.get('return_url', '')
+        if return_url and not is_youtube_url(return_url):
+            await session.navigate(return_url)
+            await asyncio.sleep(0.3)
+            status_text = await session.get_status_text()
+            await self._send_message(writer, MSG_STATUS,
+                                     encode_status(status_text), seq)
+            await self._check_and_send_native(writer, session, seq)
 
     async def _youtube_loop(self, writer, session, seq):
         """Stream video frames and audio from ffmpeg to the DOS client.
@@ -1027,6 +1077,52 @@ class RetroSurfServer:
 
                 if yt_state.get('stopping'):
                     break
+
+                # Handle seek request
+                seek_to = yt_state.pop('seek_to', None)
+                if seek_to is not None:
+                    seek_sec = seek_to / 1000.0
+                    try:
+                        await handler.stop()
+                        handler._seek_position = seek_sec
+                        await handler.start_video()
+                        if has_audio:
+                            await handler.start_audio()
+                            has_audio = handler.has_audio()
+                            # Pre-buffer audio so client has samples
+                            # before video frames arrive
+                            if has_audio:
+                                prebuf = int(handler.audio_rate * 0.1)
+                                for _i in range(5):
+                                    ad = await handler.read_audio(prebuf)
+                                    if ad:
+                                        p = encode_yt_audio(0, ad)
+                                        await self._send_message(
+                                            writer, MSG_YT_AUDIO, p, seq)
+                                    else:
+                                        has_audio = False
+                                        break
+                        pipeline.reset()  # force full frame
+                        frame_num = int(seek_sec * handler.fps)
+                        start_time = time.monotonic() - seek_sec
+                        last_send_time = time.monotonic()
+                        last_audio_time = time.monotonic()
+                        print(f"[YouTube] Seeked to {seek_sec:.1f}s")
+                        await self._send_message(writer, MSG_STATUS,
+                            encode_status(f"Seeked to {int(seek_sec)}s"),
+                            seq)
+                    except Exception as e:
+                        print(f"[YouTube] Seek failed: {e}")
+                        await self._send_message(writer, MSG_STATUS,
+                            encode_status("Seek failed"), seq)
+                        # Try to continue from where we were
+                        if not handler.is_running():
+                            handler._seek_position = 0
+                            await handler.start_video()
+                            if has_audio:
+                                await handler.start_audio()
+                                has_audio = handler.has_audio()
+                            pipeline.reset()
 
                 # Read next video frame from ffmpeg
                 rgb_data = await handler.read_video_frame()

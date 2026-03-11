@@ -214,10 +214,15 @@ we keep a 64KB software framebuffer for block accumulation, then dosmemput to VG
 - **Scroll Optimization**: Backbuffer shift + partial strip redraw for native mode (arrow key scroll redraws ~14 rows instead of full 440-row viewport)
 - **Scrollbar**: Windows 3.1 style 16px vertical scrollbar with proportional thumb, up/down arrows, track page-up/down. Works in both screenshot and native modes. Click arrows = 1-line scroll, click track = page scroll.
 - **YouTube Mode Phase 1**: Silent video playback. Server intercepts YouTube URLs, uses yt-dlp + ffmpeg to extract/transcode video to 320x200@10fps, dithers to 256-color palette, streams block-delta RLE frames. DOS client switches to Mode 13h for fast VGA writes. Space=pause, ESC=exit.
+- **YouTube Mode Phase 2**: Sound Blaster audio via DMA double-buffering (8-bit unsigned mono 11025 Hz). Audio samples arrive as MSG_YT_AUDIO interleaved with video. Ring buffer feeds DMA auto-init mode.
+- **YouTube Mode Phase 3**: Player UI overlay (progress bar with elapsed/total time, red fill, pause overlay with title). Seek via Left/Right arrow keys (10s) or mouse click on progress bar. Mouse cursor with save-under. Click video area to toggle pause.
+- **YouTube Mode Phase 4**: Seamless integration — auto-detect YouTube URLs from native link clicks, screenshot mode page navigations, and back/forward. Return to previous page after video ends/ESC.
+- **YouTube Optimizations**: Dynamic bandwidth-paced FPS (adapts to scene complexity, `youtube_target_kbps` tunable). Decoupled decode/display architecture (framebuf + dirty blocks, display on fixed clock tick). DJGPP nearptr for zero-overhead VGA block writes. Frame skipping to maintain A/V sync. Noise-tolerant block delta (threshold=4 pixels). No crop detection (black bars are free bandwidth).
+- **Connection Resilience**: Dial-up modem startup dialog (no keypresses required). Connection retry loop (client waits for server). Auto-reconnect on disconnect. Server handles client disconnect cleanly (no error spam). Clean Ctrl+C shutdown.
 
 ## What's Next
 
-1. **Polish** - Error handling, reconnect on disconnect, keepalive, double-click
+1. **Polish** - Keepalive, double-click
 
 ## Future Roadmap
 
@@ -226,9 +231,6 @@ we keep a 64KB software framebuffer for block accumulation, then dosmemput to VG
 - **File uploads** - DOS file -> server -> browser upload dialog
 - **File downloads** - Browser download -> server -> DOS file
 - **Right-click context menus** - Send right-click to server, render result
-- **YouTube mode Phase 2** - Sound Blaster audio (8-bit mono 11kHz DMA playback)
-- **YouTube mode Phase 3** - Player UI (progress bar, seek, time display)
-- **YouTube mode Phase 4** - Auto-detect YouTube URLs, seamless browsing integration
 
 ### Medium Priority
 - **Multiple tabs** - Tab bar UI, memory management

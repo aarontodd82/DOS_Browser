@@ -69,6 +69,7 @@
 #define YT_ACTION_SEEK_FWD  2
 #define YT_ACTION_SEEK_BACK 3
 #define YT_ACTION_STOP      4
+#define YT_ACTION_SEEK      5
 
 /* --- Nav Actions --- */
 #define NAV_BACK         0
